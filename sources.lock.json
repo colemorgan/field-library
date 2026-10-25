@@ -1,0 +1,115 @@
+[
+  {
+    "id": "water-storage",
+    "category": "Water",
+    "title": "How to Create an Emergency Water Supply",
+    "url": "https://www.cdc.gov/water-emergency/about/how-to-create-and-store-an-emergency-water-supply.html",
+    "publisher": "CDC",
+    "sha256": "c52f18787fe92f781be3de938686a79c6a923588f5f8ce302e7e62db0fbfe5d9",
+    "retrieved_at": "2026-10-25T12:56:09.973544+00:00",
+    "external_links": [
+      "https://www.cdc.gov/water-emergency/communication-resources/fact-sheet-making-water-safe-during-an-emergency.html",
+      "https://www.cdc.gov/water-emergency/communication-resources/fact-sheet-use-safe-water-during-an-emergency.html",
+      "https://www.ready.gov/water",
+      "https://www.ready.gov/kit",
+      "https://www.cdc.gov/disasters/index.html",
+      "https://www.cdc.gov/prepyourhealth/index.htm",
+      "https://www.cdc.gov/prepare-your-health/plan-ahead/index.html",
+      "https://www.cdc.gov/water-emergency/about/how-to-disinfect-wells-after-an-emergency.html"
+    ],
+    "omitted_media": [
+      "/water-emergency/media/images/GettyImages-942674048-16x9-1.jpg",
+      "/water-emergency/media/images/GettyImages-1160181940-16x9-1.jpg",
+      "/water-emergency/media/images/GettyImages-1048876114-16x9-1.jpg",
+      "/water-emergency/media/images/PDF-thumbnail-make-water-safe-during-emergency-p.jpg",
+      "/water-emergency/media/images/Thumbnail-334749-B_UseSafeWater-OnePager-508.jpg"
+    ],
+    "source_published": null
+  },
+  {
+    "id": "water-treatment",
+    "category": "Water",
+    "title": "How to Make Water Safe in an Emergency",
+    "url": "https://www.cdc.gov/water-emergency/about/index.html",
+    "publisher": "CDC",
+    "sha256": "403a9acc422568c7bc9cbf0feea9cb3f9aacf30ddc325f8bfc0ecd48b6e53f38",
+    "retrieved_at": "2026-10-25T12:56:10.772154+00:00",
+    "external_links": [
+      "https://www.cdc.gov/water-emergency/about/how-to-find-clean-water-in-an-emergency.html",
+      "https://www.cdc.gov/radiation-emergencies/safety/food-drinking-water-medicine-safety.html",
+      "https://www.cdc.gov/public-health-gateway/php/communications-resources/health-department-directories.html",
+      "https://www.cdc.gov/cryptosporidium/about/index.html",
+      "https://www.cdc.gov/giardia/about/index.html",
+      "https://www.cdc.gov/water-emergency/communication-resources/fact-sheet-making-water-safe-during-an-emergency.html",
+      "https://www.cdc.gov/water-emergency/media/pdfs/make-water-safe-during-emergency-p.pdf",
+      "https://www.cdc.gov/water-emergency/communication-resources/fact-sheet-use-safe-water-during-an-emergency.html",
+      "https://www.cdc.gov/water-emergency/media/pdfs/334749-B_UseSafeWater-OnePager-508.pdf",
+      "https://www.cdc.gov/infant-feeding-emergencies-toolkit/php/index.html",
+      "https://www.cdc.gov/water-emergency/about/how-to-disinfect-wells-after-an-emergency.html",
+      "https://www.cdc.gov/yellow-book/hcp/preparing-international-travelers/water-disinfection-for-travelers.html",
+      "https://www.cdc.gov/drinking-water/prevention/water-treatment-hiking-camping-traveling.html",
+      "https://wwwnc.cdc.gov/travel/page/water-disinfection",
+      "https://www.cdc.gov/natural-disasters/index.html",
+      "https://www.epa.gov/ground-water-and-drinking-water/emergency-disinfection-drinking-water",
+      "https://www.epa.gov/ground-water-and-drinking-water/safe-drinking-water-information"
+    ],
+    "omitted_media": [
+      "/water-emergency/media/images/GettyImages118217174716x9.jpg",
+      "/water-emergency/media/images/Boil-water-icon-16x9-1.jpg",
+      "/water-emergency/media/images/Bleach-icon-16x9-1.jpg",
+      "/water-emergency/media/images/Chlorine-dioxide-icon-16x9-1.jpg",
+      "/water-emergency/media/images/Portablefiltericon16x9.jpg",
+      "/water-emergency/media/images/UV-light-icon-16x9-1.jpg",
+      "/water-emergency/media/images/PDF-thumbnail-make-water-safe-during-emergency-p.jpg",
+      "/water-emergency/media/images/Thumbnail-334749-B_UseSafeWater-OnePager-508.jpg"
+    ],
+    "source_published": null
+  },
+  {
+    "id": "food",
+    "category": "Food",
+    "title": "Keep Food Safe After a Disaster or Emergency",
+    "url": "https://www.cdc.gov/food-safety/foods/keep-food-safe-after-emergency.html",
+    "publisher": "CDC",
+    "sha256": "ce1ea449b51b719539a3e91ef8f2b45e5d3b81de2608d064156eaf80fb92ec02",
+    "retrieved_at": "2026-10-25T12:56:11.593002+00:00",
+    "external_links": [
+      "https://www.foodsafety.gov/food-safety-charts/food-safety-during-power-outage#frozen",
+      "https://www.cdc.gov/food-safety/communication-resources/eat-safe-food-after-a-power-outage.html",
+      "https://www.cdc.gov/food-safety/media/pdfs/eat_safe-r5-infographic2-h_1.pdf"
+    ],
+    "omitted_media": [
+      "/food-safety/media/images/2025/06/GettyImages-2196593349.jpg",
+      "/food-safety/media/images/2024/05/Keep-refrigerator-and-freezer-doors-closed-3.png",
+      "/food-safety/media/images/2024/09/eat_safe-r5-infographic2-h_1_tmb.png"
+    ],
+    "source_published": null
+  },
+  {
+    "id": "hygiene",
+    "category": "Hygiene",
+    "title": "Guidelines for Personal Hygiene During an Emergency",
+    "url": "https://www.cdc.gov/water-emergency/safety/guidelines-for-personal-hygiene-during-an-emergency.html",
+    "publisher": "CDC",
+    "sha256": "5da48a0e1a5b423494f390a7efdc963b7849179395aae2efe561e8f980e675a4",
+    "retrieved_at": "2026-10-25T12:56:12.810573+00:00",
+    "external_links": [
+      "https://www.cdc.gov/clean-hands/about/#:~:text=Key%20times%20to%20wash%20hands",
+      "https://www.cdc.gov/clean-hands/about/#:~:text=After%20touching%20garbage-,How%20it%20works,-Washing%20your%20hands",
+      "https://www.cdc.gov/water-emergency/about/drinking-water-advisories-an-overview.html",
+      "https://dec.alaska.gov/eh/fss/resources/handwashing-station/",
+      "https://www.cdc.gov/clean-hands/about/hand-sanitizer.html",
+      "https://www.cdc.gov/oral-health/index.html",
+      "https://www.cdc.gov/natural-disasters/communication-resources/emergency-wound-care-after-a-natural-disaster-factsheet.html",
+      "https://www.cdc.gov/vibrio/about/index.html",
+      "https://www.cdc.gov/water-emergency/communication-resources/fact-sheet-safe-and-healthy-diapering-during-emergencies.html",
+      "https://www.cdc.gov/water-emergency/communication-resources/fact-sheet-planning-checklist-for-diapering-stations-in-shelters.html",
+      "https://www.cdc.gov/water-emergency/communication-resources/fact-sheet-wash-your-hands.html"
+    ],
+    "omitted_media": [
+      "/water-emergency/media/images/2024/08/personalhygiene_banner.jpg",
+      "/water-emergency/media/images/Wash-Your-Hands.JPG"
+    ],
+    "source_published": null
+  }
+]

@@ -1,0 +1,1 @@
+body { font-family: serif; line-height: 1.3; } h1,h2,h3 { page-break-after: avoid; } h1 { font-size: 1.5em; } h2 { font-size: 1.25em; } table { width: 100%; border-collapse: collapse; } td,th { border: 1px solid; padding: .2em; } a { color: inherit; }
