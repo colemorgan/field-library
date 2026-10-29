@@ -1,0 +1,591 @@
+From 6d9855e0d799ecec45d4797cc02908214d8912f4 Mon Sep 17 00:00:00 2001
+From: Cole Morgan <colerussellmorgan@gmail.com>
+Date: Wed, 28 Oct 2026 22:42:46 -0400
+Subject: [PATCH 3/4] KOReader sync: add Phone (Bluetooth) and Auto sync
+ transports on X4 Classic
+
+A Sync Transport setting (Wi-Fi, Phone (Bluetooth), Auto) is stored with
+the KOReader sync settings and shown in CrossPoint Sync settings when
+FIELD_BLE_SYNC is built in. With Phone, the sync screen stops the page
+turner radio, advertises the Field Sync relay, shows the pairing
+passkey, runs the usual sync (including Smart sync) over the relay,
+then sends bye and stops Bluetooth. Auto tries the saved Wi-Fi for
+8 s first. Clipping sync is skipped over Bluetooth.
+
+The x4c environment enables FIELD_BLE_SYNC and keeps NimBLE's
+peripheral and broadcaster roles.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ lib/I18n/translations/english.yaml            |  10 +
+ lib/KOReaderSync/KOReaderCredentialStore.cpp  |   2 +
+ lib/KOReaderSync/KOReaderCredentialStore.h    |  14 ++
+ platformio.ini                                |   7 +
+ .../reader/KOReaderSyncActivity.cpp           | 238 +++++++++++++++++-
+ src/activities/reader/KOReaderSyncActivity.h  |  32 ++-
+ .../settings/KOReaderSettingsActivity.cpp     |  28 ++-
+ .../settings/KOReaderSettingsActivity.h       |   4 +
+ 8 files changed, 322 insertions(+), 13 deletions(-)
+
+diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
+index 6676091..00d632d 100644
+--- a/lib/I18n/translations/english.yaml
++++ b/lib/I18n/translations/english.yaml
+@@ -195,6 +195,16 @@ STR_CLIPPING_SYNC_FAILED: "Could Not Sync Clippings"
+ STR_SYNC_BEHAVIOR: "Sync Behavior"
+ STR_ASK_EVERY_TIME: "Ask Every Time"
+ STR_SMART_SYNC: "Smart Sync"
++STR_SYNC_TRANSPORT: "Sync Transport"
++STR_SYNC_TRANSPORT_WIFI: "Wi-Fi"
++STR_SYNC_TRANSPORT_PHONE: "Phone (Bluetooth)"
++STR_SYNC_TRANSPORT_AUTO: "Auto"
++STR_FIELD_SYNC_OPEN_APP: "Open Field Sync on your phone"
++STR_FIELD_SYNC_TAP_SYNC: "and tap Sync"
++STR_FIELD_SYNC_PASSKEY: "Enter this code on your phone"
++STR_FIELD_SYNC_NO_PHONE: "No phone connected"
++STR_FIELD_SYNC_VERSION: "Update the Field Sync app"
++STR_FIELD_SYNC_PHONE_LEFT: "Phone disconnected"
+ STR_AUTHENTICATE: "Authenticate"
+ STR_SIGN_UP: "Sign Up"
+ STR_CREATING_ACCOUNT: "Creating account..."
+diff --git a/lib/KOReaderSync/KOReaderCredentialStore.cpp b/lib/KOReaderSync/KOReaderCredentialStore.cpp
+index 88243e1..528bb16 100644
+--- a/lib/KOReaderSync/KOReaderCredentialStore.cpp
++++ b/lib/KOReaderSync/KOReaderCredentialStore.cpp
+@@ -28,6 +28,7 @@ void KOReaderCredentialStore::toJson(JsonDocument& doc) const {
+   doc["sendMetadata"] = getSendMetadata();
+   doc["syncClippings"] = getSyncClippings();
+   doc["syncBehavior"] = static_cast<uint8_t>(getSyncBehavior());
++  doc["syncTransport"] = static_cast<uint8_t>(getTransportMode());
+   JsonArray headers = doc["headers"].to<JsonArray>();
+   for (const auto& header : customHeaders) {
+     JsonObject headerObj = headers.add<JsonObject>();
+@@ -85,6 +86,7 @@ bool KOReaderCredentialStore::fromJson(JsonVariantConst doc) {
+   }
+   setSendMetadata(doc["sendMetadata"] | false);
+   setSyncClippings(doc["syncClippings"] | false);
++  setTransportMode(static_cast<SyncTransportMode>(doc["syncTransport"] | static_cast<uint8_t>(0)));
+ 
+   size_t headerIndex = 0;
+   for (JsonObjectConst headerObj : doc["headers"].as<JsonArrayConst>()) {
+diff --git a/lib/KOReaderSync/KOReaderCredentialStore.h b/lib/KOReaderSync/KOReaderCredentialStore.h
+index 60701ee..4767976 100644
+--- a/lib/KOReaderSync/KOReaderCredentialStore.h
++++ b/lib/KOReaderSync/KOReaderCredentialStore.h
+@@ -24,6 +24,14 @@ enum class KOReaderSyncBehavior : uint8_t {
+   SMART = 1,           // Auto-resolve simple cases using furthest progress.
+ };
+ 
++// How sync requests reach the server. PHONE relays them over Bluetooth through
++// the Field Sync phone app; AUTO tries the saved Wi-Fi first, then the phone.
++enum class SyncTransportMode : uint8_t {
++  WIFI = 0,
++  PHONE = 1,
++  AUTO = 2,
++};
++
+ // Protocol family/capability profile selected for the configured sync server.
+ enum class KOReaderServerType : uint8_t {
+   CROSSPOINT = 0,  // CrossPoint protocol extensions, including rich position.
+@@ -48,6 +56,7 @@ class KOReaderCredentialStore : public PersistableStore<KOReaderCredentialStore>
+   bool syncClippings = false;                                       // Opt-in crosspoint-sync extension
+   KOReaderSyncBehavior syncBehavior = KOReaderSyncBehavior::SMART;
+   KOReaderServerType serverType = KOReaderServerType::CROSSPOINT;
++  SyncTransportMode transportMode = SyncTransportMode::WIFI;
+ 
+   // Fixed-size to avoid vector growth on the settings edit path; an empty
+   // name marks an unused slot.
+@@ -108,6 +117,11 @@ class KOReaderCredentialStore : public PersistableStore<KOReaderCredentialStore>
+   void setSyncBehavior(KOReaderSyncBehavior behavior);
+   KOReaderSyncBehavior getSyncBehavior() const { return syncBehavior; }
+ 
++  void setTransportMode(SyncTransportMode mode) {
++    transportMode = mode <= SyncTransportMode::AUTO ? mode : SyncTransportMode::WIFI;
++  }
++  SyncTransportMode getTransportMode() const { return transportMode; }
++
+   // Custom headers sent with every sync request (index must be < MAX_CUSTOM_HEADERS)
+   void setCustomHeader(size_t index, const std::string& name, const std::string& value);
+   const std::array<HttpHeader, MAX_CUSTOM_HEADERS>& getCustomHeaders() const { return customHeaders; }
+diff --git a/platformio.ini b/platformio.ini
+index f96f663..231d911 100644
+--- a/platformio.ini
++++ b/platformio.ini
+@@ -492,6 +492,13 @@ build_flags =
+   -DLOG_LEVEL=2
+   ; X4C SD is native SDMMC (1-bit), mounted through SdFat's block-device API.
+   -DUSE_BLOCK_DEVICE_INTERFACE=1
++  ; Field Sync (lib/FieldBleSync): sync progress through the phone over BLE.
++  -DFIELD_BLE_SYNC=1
++; Field Sync is a GATT peripheral, so NimBLE's peripheral and broadcaster roles stay on.
++build_unflags =
++  ${base.build_unflags}
++  -DCONFIG_BT_NIMBLE_ROLE_PERIPHERAL_DISABLED=1
++  -DCONFIG_BT_NIMBLE_ROLE_BROADCASTER_DISABLED=1
+ 
+ [env:x4c-gh_release]
+ extends = base
+diff --git a/src/activities/reader/KOReaderSyncActivity.cpp b/src/activities/reader/KOReaderSyncActivity.cpp
+index 75cd990..8f7109a 100644
+--- a/src/activities/reader/KOReaderSyncActivity.cpp
++++ b/src/activities/reader/KOReaderSyncActivity.cpp
+@@ -10,6 +10,7 @@
+ 
+ #include <algorithm>
+ #include <cassert>
++#include <optional>
+ 
+ #include "Epub/Section.h"
+ #include "EpubReaderUtils.h"
+@@ -29,6 +30,12 @@
+ #include "util/PluginEvents.h"
+ #include "util/PluginHttp.h"
+ 
++#if defined(FIELD_BLE_SYNC) && FIELD_BLE_SYNC
++#include <BlePageTurner.h>
++
++#include "WifiCredentialStore.h"
++#endif
++
+ namespace fui = freeink::ui;
+ 
+ namespace {
+@@ -101,7 +108,13 @@ void KOReaderSyncActivity::saveProgressAndReturn(int spineIndex, int page) {
+   returnToReader();
+ }
+ 
+-void KOReaderSyncActivity::returnToReader() { activityManager.goToReader(epubPath); }
++void KOReaderSyncActivity::returnToReader() {
++#if defined(FIELD_BLE_SYNC) && FIELD_BLE_SYNC
++  // Outside the render lock, before the reader (and its page turner) comes back.
++  finishPhone(state == SYNC_FAILED ? "error" : "done");
++#endif
++  activityManager.goToReader(epubPath);
++}
+ 
+ bool KOReaderSyncActivity::smartSyncEnabled() const {
+   return KOREADER_STORE.getSyncBehavior() == KOReaderSyncBehavior::SMART;
+@@ -158,7 +171,8 @@ void KOReaderSyncActivity::onWifiSelectionComplete(const bool success) {
+ }
+ 
+ void KOReaderSyncActivity::performSync() {
+-  WifiPowerSaveGuard psGuard;
++  std::optional<WifiPowerSaveGuard> psGuard;
++  if (!usingPhone()) psGuard.emplace();
+   const DocumentMatchMethod primaryMethod = KOREADER_STORE.getMatchMethod();
+   documentHash = calculateDocumentHashForMethod(epubPath, primaryMethod);
+   if (documentHash.empty()) {
+@@ -174,7 +188,9 @@ void KOReaderSyncActivity::performSync() {
+ 
+   LOG_DBG("KOSync", "Document hash (%s): %s", matchMethodName(primaryMethod), documentHash.c_str());
+ 
+-  if (KOREADER_STORE.getSyncClippings()) {
++  // Clipping sync uses its own HTTP client, which the phone relay does not carry.
++  if (KOREADER_STORE.getSyncClippings() && usingPhone()) LOG_INF("KOSync", "Clipping sync skipped over Bluetooth");
++  if (KOREADER_STORE.getSyncClippings() && !usingPhone()) {
+     {
+       RenderLock lock(*this);
+       statusMessage = tr(STR_SYNCING_CLIPPINGS);
+@@ -417,14 +433,18 @@ void KOReaderSyncActivity::performUpload() {
+   epub.reset();
+ 
+   KOReaderSyncClient::Error result;
+-  {
+-    // Restore power-save before esp_wifi_stop below; set_ps on a stopped radio fails.
+-    WifiPowerSaveGuard psGuard;
++  if (usingPhone()) {
+     result = KOReaderSyncClient::updateProgress(progress);
+-  }
++  } else {
++    {
++      // Restore power-save before esp_wifi_stop below; set_ps on a stopped radio fails.
++      WifiPowerSaveGuard psGuard;
++      result = KOReaderSyncClient::updateProgress(progress);
++    }
+ 
+-  // Drop the radio while user reads the result; full teardown happens at silent reboot.
+-  esp_wifi_stop();
++    // Drop the radio while user reads the result; full teardown happens at silent reboot.
++    esp_wifi_stop();
++  }
+ 
+   if (result != KOReaderSyncClient::OK) {
+     {
+@@ -459,6 +479,18 @@ void KOReaderSyncActivity::onEnter() {
+     return;
+   }
+ 
++#if defined(FIELD_BLE_SYNC) && FIELD_BLE_SYNC
++  // Plugin events need the Wi-Fi server path; only progress sync can use the phone.
++  if (!pluginEventsOnly && WiFi.status() != WL_CONNECTED) {
++    const SyncTransportMode mode = KOREADER_STORE.getTransportMode();
++    if (mode == SyncTransportMode::PHONE || (mode == SyncTransportMode::AUTO && !startAutoWifi())) {
++      startPhoneSync();
++      return;
++    }
++    if (mode == SyncTransportMode::AUTO) return;  // loopAutoWifi() continues
++  }
++#endif
++
+   // Past this point every path uses WiFi.
+   wifiActivated = true;
+ 
+@@ -477,6 +509,9 @@ void KOReaderSyncActivity::onEnter() {
+ 
+ void KOReaderSyncActivity::onExit() {
+   Activity::onExit();
++#if defined(FIELD_BLE_SYNC) && FIELD_BLE_SYNC
++  finishPhone(state == SYNC_FAILED ? "error" : "done");  // normally done already by returnToReader()
++#endif
+ 
+   if (wifiActivated) {
+     WiFi.disconnect(false);
+@@ -682,7 +717,27 @@ void KOReaderSyncActivity::render(RenderLock&&) {
+     return;
+   }
+ 
+-  if (state == SYNCING || state == UPLOADING) {
++#if defined(FIELD_BLE_SYNC) && FIELD_BLE_SYNC
++  if (state == PHONE_WAITING) {
++    UITheme::drawCenteredText(renderer, screen, UI_10_FONT_ID, top - 40, tr(STR_FIELD_SYNC_OPEN_APP), true,
++                              EpdFontFamily::BOLD);
++    UITheme::drawCenteredText(renderer, screen, UI_10_FONT_ID, top - 10, tr(STR_FIELD_SYNC_TAP_SYNC), true,
++                              EpdFontFamily::BOLD);
++    UITheme::drawCenteredText(renderer, screen, UI_10_FONT_ID, top + 20, phoneName.c_str());
++    if (shownPasskey >= 0) {
++      char passkey[8];
++      snprintf(passkey, sizeof(passkey), "%06ld", static_cast<long>(shownPasskey));
++      UITheme::drawCenteredText(renderer, screen, UI_10_FONT_ID, top + 70, tr(STR_FIELD_SYNC_PASSKEY));
++      UITheme::drawCenteredText(renderer, screen, UI_12_FONT_ID, top + 100, passkey, true, EpdFontFamily::BOLD);
++    }
++    const auto labels = mappedInput.mapLabels(tr(STR_CANCEL), "", "", "");
++    GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
++    renderer.displayBuffer();
++    return;
++  }
++#endif
++
++  if (state == SYNCING || state == UPLOADING || state == AUTO_WIFI) {
+     UITheme::drawCenteredText(renderer, screen, UI_10_FONT_ID, top, statusMessage.c_str(), true, EpdFontFamily::BOLD);
+     renderer.displayBuffer();
+     return;
+@@ -732,6 +787,29 @@ void KOReaderSyncActivity::render(RenderLock&&) {
+ }
+ 
+ void KOReaderSyncActivity::loop() {
++#if defined(FIELD_BLE_SYNC) && FIELD_BLE_SYNC
++  if (state == AUTO_WIFI) {
++    loopAutoWifi();
++    return;
++  }
++  if (state == PHONE_WAITING) {
++    loopPhoneWaiting();
++    return;
++  }
++  // The exchange is over: say bye and give the radio back before the result shows.
++  if (phone && (state == SYNC_FAILED || state == UPLOAD_COMPLETE || state == SYNC_COMPLETE)) {
++    const bool phoneLeft = relay && relay->closed();
++    finishPhone(state == SYNC_FAILED ? "error" : "done");
++    if (state == SYNC_FAILED && phoneLeft) {
++      {
++        RenderLock lock(*this);
++        statusMessage = tr(STR_FIELD_SYNC_PHONE_LEFT);
++      }
++      requestUpdate();
++    }
++  }
++#endif
++
+   if (state == NO_CREDENTIALS || state == SYNC_FAILED || state == UPLOAD_COMPLETE || state == SYNC_COMPLETE) {
+     if (autoReturnAt != 0 && millis() >= autoReturnAt) {
+       returnToReader();
+@@ -786,3 +864,143 @@ void KOReaderSyncActivity::loop() {
+     return;
+   }
+ }
++
++#if defined(FIELD_BLE_SYNC) && FIELD_BLE_SYNC
++bool KOReaderSyncActivity::usingPhone() const { return relay != nullptr; }
++
++void KOReaderSyncActivity::failSync(const char* message) {
++  {
++    RenderLock lock(*this);
++    state = SYNC_FAILED;
++    statusMessage = message;
++  }
++  requestUpdate(true);
++}
++
++bool KOReaderSyncActivity::startAutoWifi() {
++  WIFI_STORE.loadFromFile();
++  const std::string lastSsid = WIFI_STORE.getLastConnectedSsid();
++  const auto cred = lastSsid.empty() ? std::nullopt : WIFI_STORE.findCredential(lastSsid);
++  if (!cred) {
++    LOG_DBG("KOSync", "Auto transport: no saved Wi-Fi, using the phone");
++    return false;
++  }
++  LOG_DBG("KOSync", "Auto transport: trying saved Wi-Fi %s", cred->ssid.c_str());
++  wifiActivated = true;
++  WiFi.persistent(false);
++  WiFi.mode(WIFI_STA);
++  if (cred->password.empty()) {
++    WiFi.begin(cred->ssid.c_str());
++  } else {
++    WiFi.begin(cred->ssid.c_str(), cred->password.c_str());
++  }
++  {
++    RenderLock lock(*this);
++    state = AUTO_WIFI;
++    statusMessage = tr(STR_CONNECTING_SAVED_WIFI);
++  }
++  autoWifiStartMs = millis();
++  requestUpdate();
++  return true;
++}
++
++void KOReaderSyncActivity::loopAutoWifi() {
++  if (WiFi.status() == WL_CONNECTED) {
++    onWifiSelectionComplete(true);
++    return;
++  }
++  if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
++    returnToReader();
++    return;
++  }
++  if (millis() - autoWifiStartMs < AUTO_WIFI_TIMEOUT_MS) return;
++  LOG_DBG("KOSync", "Auto transport: saved Wi-Fi not reached, using the phone");
++  // Wi-Fi and Bluetooth never run together: release the Wi-Fi driver first.
++  WiFi.disconnect(true);
++  WiFi.mode(WIFI_OFF);
++  startPhoneSync();
++}
++
++void KOReaderSyncActivity::startPhoneSync() {
++  // The page turner owns NimBLE outside this screen; it is already stopped for the
++  // screen change, and this makes sure no stop is still in flight.
++  if (!bleturner::stopNow(2000)) {
++    LOG_ERR("KOSync", "Page turner radio did not stop; cannot start Field Sync");
++    failSync(tr(STR_BT_START_FAILED));
++    return;
++  }
++  phone = std::make_unique<fieldsync::BlePeripheral>();
++  if (!phone->start(KOREADER_STORE.getBaseUrl(), CROSSPOINT_VERSION "+field-ble")) {
++    phone.reset();
++    failSync(tr(STR_BT_START_FAILED));
++    return;
++  }
++  relay = std::make_unique<fieldsync::RelayTransport>(*phone);
++  {
++    RenderLock lock(*this);
++    phoneName = phone->deviceName();
++    shownPasskey = -1;
++    state = PHONE_WAITING;
++  }
++  requestUpdate(true);
++}
++
++void KOReaderSyncActivity::loopPhoneWaiting() {
++  if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
++    finishPhone("cancel");
++    returnToReader();
++    return;
++  }
++  const auto phase = phone->poll();
++  const int32_t passkey = phone->passkey();
++  if (passkey != shownPasskey) {
++    {
++      RenderLock lock(*this);
++      shownPasskey = passkey;
++    }
++    requestUpdate(true);
++  }
++
++  switch (phase) {
++    case fieldsync::BlePeripheral::Phase::Ready:
++      LOG_DBG("KOSync", "Phone ready, starting sync over Bluetooth");
++      KOReaderSyncClient::setTransport(relay.get());
++      {
++        RenderLock lock(*this);
++        state = SYNCING;
++        statusMessage = tr(STR_CALC_HASH);
++      }
++      requestUpdate(true);
++      performSync();
++      return;
++    case fieldsync::BlePeripheral::Phase::TimedOut:
++      finishPhone("timeout");
++      failSync(tr(STR_FIELD_SYNC_NO_PHONE));
++      return;
++    case fieldsync::BlePeripheral::Phase::Failed: {
++      const auto failure = phone->failure();
++      finishPhone("error");
++      failSync(failure == fieldsync::BlePeripheral::Failure::Version     ? tr(STR_FIELD_SYNC_VERSION)
++               : failure == fieldsync::BlePeripheral::Failure::PhoneLeft ? tr(STR_FIELD_SYNC_PHONE_LEFT)
++                                                                         : tr(STR_BT_FAILED));
++      return;
++    }
++    default:
++      return;
++  }
++}
++
++void KOReaderSyncActivity::finishPhone(const char* reason) {
++  if (!phone) return;
++  KOReaderSyncClient::setTransport(nullptr);
++  phone->sendBye(reason);
++  phone->stop();
++  relay.reset();
++  phone.reset();
++  // No render lock here: onExit() runs with it held. PHONE_WAITING, the only
++  // state that draws the passkey, is never current once the phone is gone.
++  shownPasskey = -1;
++}
++#else
++bool KOReaderSyncActivity::usingPhone() const { return false; }
++#endif
+diff --git a/src/activities/reader/KOReaderSyncActivity.h b/src/activities/reader/KOReaderSyncActivity.h
+index 7e83fae..752df21 100644
+--- a/src/activities/reader/KOReaderSyncActivity.h
++++ b/src/activities/reader/KOReaderSyncActivity.h
+@@ -10,6 +10,11 @@
+ #include "activities/Activity.h"
+ #include "components/UiAppHost.h"
+ 
++#if defined(FIELD_BLE_SYNC) && FIELD_BLE_SYNC
++#include <FieldBlePeripheral.h>
++#include <FieldSyncRelay.h>
++#endif
++
+ /**
+  * Activity for syncing reading progress with KOReader sync server.
+  *
+@@ -30,7 +35,10 @@ class KOReaderSyncActivity final : public Activity, private UiAppHost {
+   void onExit() override;
+   void loop() override;
+   void render(RenderLock&&) override;
+-  bool preventAutoSleep() override { return state == CONNECTING || state == SYNCING || state == UPLOADING; }
++  bool preventAutoSleep() override {
++    return state == CONNECTING || state == SYNCING || state == UPLOADING || state == AUTO_WIFI ||
++           state == PHONE_WAITING;
++  }
+ 
+  private:
+   enum State {
+@@ -43,7 +51,9 @@ class KOReaderSyncActivity final : public Activity, private UiAppHost {
+     SYNC_COMPLETE,
+     NO_REMOTE_PROGRESS,
+     SYNC_FAILED,
+-    NO_CREDENTIALS
++    NO_CREDENTIALS,
++    AUTO_WIFI,      // Sync Transport Auto: trying the saved Wi-Fi before the phone
++    PHONE_WAITING,  // Bluetooth relay up, waiting for the Field Sync phone app
+   };
+ 
+   std::shared_ptr<Epub> epub;  // null until lazy-loaded after TLS in performSync()
+@@ -80,6 +90,24 @@ class KOReaderSyncActivity final : public Activity, private UiAppHost {
+   // plugged-outbox events instead of syncing progress.
+   bool pluginEventsOnly = false;
+ 
++#if defined(FIELD_BLE_SYNC) && FIELD_BLE_SYNC
++  // Field Sync: requests go through the phone while these exist (see PROTOCOL.md).
++  std::unique_ptr<fieldsync::BlePeripheral> phone;
++  std::unique_ptr<fieldsync::RelayTransport> relay;
++  std::string phoneName;
++  int32_t shownPasskey = -1;
++  unsigned long autoWifiStartMs = 0;
++  static constexpr unsigned long AUTO_WIFI_TIMEOUT_MS = 8000;
++
++  bool startAutoWifi();
++  void loopAutoWifi();
++  void startPhoneSync();
++  void loopPhoneWaiting();
++  void finishPhone(const char* reason);
++  void failSync(const char* message);
++#endif
++  bool usingPhone() const;
++
+   void onWifiSelectionComplete(bool success);
+   void performSync();
+   void performUpload();
+diff --git a/src/activities/settings/KOReaderSettingsActivity.cpp b/src/activities/settings/KOReaderSettingsActivity.cpp
+index d1b3a2c..04d0d92 100644
+--- a/src/activities/settings/KOReaderSettingsActivity.cpp
++++ b/src/activities/settings/KOReaderSettingsActivity.cpp
+@@ -27,17 +27,33 @@ constexpr int IDX_MATCH_METHOD = 6;
+ constexpr int IDX_SEND_METADATA = 7;
+ constexpr int IDX_SYNC_BEHAVIOR = 8;
+ constexpr int IDX_SYNC_CLIPPINGS = 9;
++#if defined(FIELD_BLE_SYNC) && FIELD_BLE_SYNC
++constexpr int IDX_SYNC_TRANSPORT = 10;
++constexpr int IDX_SIGN_UP = 11;
++constexpr int IDX_AUTHENTICATE = 12;
++#else
++constexpr int IDX_SYNC_TRANSPORT = -1;
+ constexpr int IDX_SIGN_UP = 10;
+ constexpr int IDX_AUTHENTICATE = 11;
++#endif
+ 
+ constexpr StrId menuNames[KOReaderSettingsActivity::MENU_ITEMS] = {
+     StrId::STR_USERNAME,        StrId::STR_PASSWORD,        StrId::STR_SYNC_SERVER_URL,   StrId::STR_SERVER_TYPE,
+     StrId::STR_CUSTOM_HEADER_1, StrId::STR_CUSTOM_HEADER_2, StrId::STR_DOCUMENT_MATCHING, StrId::STR_SEND_METADATA,
+-    StrId::STR_SYNC_BEHAVIOR,   StrId::STR_SYNC_CLIPPINGS,  StrId::STR_SIGN_UP,           StrId::STR_AUTHENTICATE};
++    StrId::STR_SYNC_BEHAVIOR,   StrId::STR_SYNC_CLIPPINGS,
++#if defined(FIELD_BLE_SYNC) && FIELD_BLE_SYNC
++    StrId::STR_SYNC_TRANSPORT,
++#endif
++    StrId::STR_SIGN_UP,         StrId::STR_AUTHENTICATE};
+ 
+ constexpr int SERVER_TYPE_ITEMS = 3;
+ constexpr StrId serverTypeNames[SERVER_TYPE_ITEMS] = {StrId::STR_CROSSPOINT, StrId::STR_KOSYNC_SERVER,
+                                                       StrId::STR_OTHER};
++
++// Indexed by SyncTransportMode.
++constexpr int SYNC_TRANSPORT_ITEMS = 3;
++constexpr StrId syncTransportNames[SYNC_TRANSPORT_ITEMS] = {
++    StrId::STR_SYNC_TRANSPORT_WIFI, StrId::STR_SYNC_TRANSPORT_PHONE, StrId::STR_SYNC_TRANSPORT_AUTO};
+ }  // namespace
+ 
+ KOReaderSettingsActivity::KOReaderSettingsActivity(GfxRenderer& renderer, MappedInputManager& mappedInput)
+@@ -145,6 +161,14 @@ void KOReaderSettingsActivity::activateIndex(const int index) {
+     KOREADER_STORE.setSyncClippings(!KOREADER_STORE.getSyncClippings());
+     KOREADER_STORE.saveToFile();
+     requestUpdate();
++  } else if (index == IDX_SYNC_TRANSPORT) {
++    optionPopup.show(StrId::STR_SYNC_TRANSPORT, syncTransportNames, SYNC_TRANSPORT_ITEMS,
++                     static_cast<int>(KOREADER_STORE.getTransportMode()), [this](const int selected) {
++                       if (selected == static_cast<int>(KOREADER_STORE.getTransportMode())) return;
++                       KOREADER_STORE.setTransportMode(static_cast<SyncTransportMode>(selected));
++                       KOREADER_STORE.saveToFile();
++                     });
++    requestUpdate();
+   } else if (index == IDX_SIGN_UP) {
+     if (!KOREADER_STORE.hasCredentials()) return;
+     startActivityForResult(
+@@ -195,6 +219,8 @@ void KOReaderSettingsActivity::buildScreen(UiScreen& screen) {
+           KOREADER_STORE.getMatchMethod() == DocumentMatchMethod::FILENAME ? tr(STR_FILENAME) : tr(STR_BINARY);
+     } else if (i == IDX_SEND_METADATA || i == IDX_SYNC_CLIPPINGS) {
+       rowValues_[i].clear();
++    } else if (i == IDX_SYNC_TRANSPORT) {
++      rowValues_[i] = I18N.get(syncTransportNames[static_cast<int>(KOREADER_STORE.getTransportMode())]);
+     } else if (i == IDX_SYNC_BEHAVIOR) {
+       rowValues_[i] =
+           KOREADER_STORE.getSyncBehavior() == KOReaderSyncBehavior::SMART ? tr(STR_SMART_SYNC) : tr(STR_ASK_EVERY_TIME);
+diff --git a/src/activities/settings/KOReaderSettingsActivity.h b/src/activities/settings/KOReaderSettingsActivity.h
+index 55079b0..b683615 100644
+--- a/src/activities/settings/KOReaderSettingsActivity.h
++++ b/src/activities/settings/KOReaderSettingsActivity.h
+@@ -13,7 +13,11 @@ class KOReaderSettingsActivity final : public UiListActivity {
+  public:
+   explicit KOReaderSettingsActivity(GfxRenderer& renderer, MappedInputManager& mappedInput);
+ 
++#if defined(FIELD_BLE_SYNC) && FIELD_BLE_SYNC
++  static constexpr int MENU_ITEMS = 13;  // + Sync Transport
++#else
+   static constexpr int MENU_ITEMS = 12;
++#endif
+ 
+   void render(RenderLock&&) override;
+ 
+-- 
+2.56.0
+

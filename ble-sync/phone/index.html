@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#f6f4ef" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#16181b" media="(prefers-color-scheme: dark)">
+  <meta name="referrer" content="no-referrer">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src https: http://localhost:* http://127.0.0.1:*; img-src 'self' data:; style-src 'self'; script-src 'self'; base-uri 'none'; form-action 'none'">
+  <title>Field Sync</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="style.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Field Sync</h1>
+      <p class="sub">Sync your reader's progress through this phone over Bluetooth.</p>
+    </header>
+
+    <div id="support" class="notice warn" role="alert" hidden></div>
+
+    <section class="primary">
+      <button id="sync" class="big" type="button" disabled>Sync with reader</button>
+      <button id="stop" class="secondary" type="button" hidden>Stop</button>
+      <p id="status" class="status" role="status" aria-live="polite">Loading…</p>
+      <p class="hint">On the reader choose <strong>Sync Progress</strong> with transport
+        <strong>Phone (Bluetooth)</strong>, then tap the button and pick <code>FieldSync-…</code>.
+        The first time, your phone asks for a <strong>6-digit passkey</strong>: type the number shown
+        on the reader's screen.</p>
+    </section>
+
+    <div id="blocked" class="notice warn" role="alert" hidden>
+      <p>The reader wants to sync with <strong id="blocked-origin"></strong>, which is not in your
+        allowed servers. Nothing was sent.</p>
+      <button id="allow-blocked" class="secondary" type="button">Allow this server</button>
+    </div>
+
+    <section>
+      <h2>Activity</h2>
+      <ol id="log" class="log" aria-live="polite"></ol>
+      <p id="log-empty" class="muted">Nothing relayed yet. Request details and credentials are never shown or stored.</p>
+    </section>
+
+    <section>
+      <h2>Allowed servers</h2>
+      <p class="muted">The phone only relays to these sync servers (HTTPS only).</p>
+      <ul id="servers" class="servers"></ul>
+      <form id="add-server" class="add-server">
+        <label for="server-input" class="visually-hidden">Server address</label>
+        <input id="server-input" type="url" inputmode="url" placeholder="https://sync.example.com"
+               autocomplete="off" autocapitalize="off" spellcheck="false" required>
+        <button type="submit" class="secondary">Add</button>
+      </form>
+      <p id="server-error" class="error" role="alert" hidden></p>
+      <button id="reset-servers" class="link" type="button">Reset to defaults</button>
+    </section>
+
+    <footer class="muted">
+      Field Sync keeps no credentials. Custom servers must allow cross-origin requests (CORS) from
+      this page.
+    </footer>
+  </main>
+</body>
+</html>

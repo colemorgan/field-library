@@ -1,0 +1,50 @@
+{
+  "protocol": 1,
+  "maxMessageBytes": 16384,
+  "framing": [
+    {
+      "name": "hello-single-mtu247",
+      "message": "{\"t\":\"hello\",\"v\":1,\"app\":\"field-sync-web\",\"appVersion\":\"0.1.0\"}",
+      "msgId": 7,
+      "mtu": 247,
+      "chunks": [
+        "03077b2274223a2268656c6c6f222c2276223a312c22617070223a226669656c642d73796e632d776562222c2261707056657273696f6e223a22302e312e30227d"
+      ]
+    },
+    {
+      "name": "hello-mtu23",
+      "message": "{\"t\":\"hello\",\"v\":1,\"app\":\"field-sync-web\",\"appVersion\":\"0.1.0\"}",
+      "msgId": 7,
+      "mtu": 23,
+      "chunks": [
+        "01077b2274223a2268656c6c6f222c2276223a31",
+        "00072c22617070223a226669656c642d73796e63",
+        "00072d776562222c2261707056657273696f6e22",
+        "02073a22302e312e30227d"
+      ]
+    },
+    {
+      "name": "req-utf8-mtu23",
+      "message": "{\"t\":\"req\",\"id\":1,\"method\":\"GET\",\"path\":\"/syncs/progress/abc\",\"headers\":{\"x-auth-user\":\"Zoë\"},\"body\":null}",
+      "msgId": 255,
+      "mtu": 23,
+      "chunks": [
+        "01ff7b2274223a22726571222c226964223a312c",
+        "00ff226d6574686f64223a22474554222c227061",
+        "00ff7468223a222f73796e63732f70726f677265",
+        "00ff73732f616263222c2268656164657273223a",
+        "00ff7b22782d617574682d75736572223a225a6f",
+        "02ffc3ab227d2c22626f6479223a6e756c6c7d"
+      ]
+    },
+    {
+      "name": "bye-exact-18",
+      "message": "{\"t\":\"bye\",\"r\":1}",
+      "msgId": 0,
+      "mtu": 23,
+      "chunks": [
+        "03007b2274223a22627965222c2272223a317d"
+      ]
+    }
+  ]
+}

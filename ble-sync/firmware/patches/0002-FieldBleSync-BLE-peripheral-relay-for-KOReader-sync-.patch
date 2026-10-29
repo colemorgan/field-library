@@ -1,0 +1,1656 @@
+From a8438b3a75c86ac7b2aea296a55b980027d90c97 Mon Sep 17 00:00:00 2001
+From: Cole Morgan <colerussellmorgan@gmail.com>
+Date: Wed, 28 Oct 2026 22:42:46 -0400
+Subject: [PATCH 2/4] FieldBleSync: BLE peripheral relay for KOReader sync via
+ a phone
+
+New library implementing the Field Sync protocol v1 (reader side):
+chunk framing with reassembly (16 KB cap, 5 s gap timeout, FIRST
+resets), hello/req/res/bye/error messages, a RelayTransport that sends
+one request at a time and waits up to 30 s for the matching response,
+and a NimBLE GATT peripheral (FIELD_BLE_SYNC builds only) with an
+encrypted, MITM-authenticated, bonded link, DisplayOnly passkey,
+FieldSync-XXXX advertising with a 60 s timeout and full stack teardown.
+
+Host tests cover the framing vectors from the protocol, oversize,
+timeout and FIRST-reset handling, message escaping and parsing, and the
+relay's request/response matching against a fake link.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ lib/FieldBleSync/include/FieldBlePeripheral.h |  98 +++++
+ lib/FieldBleSync/include/FieldSyncFraming.h   |  55 +++
+ lib/FieldBleSync/include/FieldSyncMessages.h  |  39 ++
+ lib/FieldBleSync/include/FieldSyncRelay.h     |  53 +++
+ lib/FieldBleSync/library.json                 |  11 +
+ lib/FieldBleSync/src/FieldBlePeripheral.cpp   | 338 ++++++++++++++++++
+ lib/FieldBleSync/src/FieldSyncFraming.cpp     |  76 ++++
+ lib/FieldBleSync/src/FieldSyncMessages.cpp    | 115 ++++++
+ lib/FieldBleSync/src/FieldSyncRelay.cpp       |  65 ++++
+ lib/FieldBleSync/test/CMakeLists.txt          |  47 +++
+ lib/FieldBleSync/test/FramingTest.cpp         | 225 ++++++++++++
+ lib/FieldBleSync/test/MessagesTest.cpp        | 121 +++++++
+ lib/FieldBleSync/test/RelayTransportTest.cpp  | 212 +++++++++++
+ lib/FieldBleSync/test/vectors.json            |  50 +++
+ test/CMakeLists.txt                           |   1 +
+ 15 files changed, 1506 insertions(+)
+ create mode 100644 lib/FieldBleSync/include/FieldBlePeripheral.h
+ create mode 100644 lib/FieldBleSync/include/FieldSyncFraming.h
+ create mode 100644 lib/FieldBleSync/include/FieldSyncMessages.h
+ create mode 100644 lib/FieldBleSync/include/FieldSyncRelay.h
+ create mode 100644 lib/FieldBleSync/library.json
+ create mode 100644 lib/FieldBleSync/src/FieldBlePeripheral.cpp
+ create mode 100644 lib/FieldBleSync/src/FieldSyncFraming.cpp
+ create mode 100644 lib/FieldBleSync/src/FieldSyncMessages.cpp
+ create mode 100644 lib/FieldBleSync/src/FieldSyncRelay.cpp
+ create mode 100644 lib/FieldBleSync/test/CMakeLists.txt
+ create mode 100644 lib/FieldBleSync/test/FramingTest.cpp
+ create mode 100644 lib/FieldBleSync/test/MessagesTest.cpp
+ create mode 100644 lib/FieldBleSync/test/RelayTransportTest.cpp
+ create mode 100644 lib/FieldBleSync/test/vectors.json
+
+diff --git a/lib/FieldBleSync/include/FieldBlePeripheral.h b/lib/FieldBleSync/include/FieldBlePeripheral.h
+new file mode 100644
+index 0000000..4dd2005
+--- /dev/null
++++ b/lib/FieldBleSync/include/FieldBlePeripheral.h
+@@ -0,0 +1,98 @@
++#pragma once
++
++#if defined(FIELD_BLE_SYNC) && FIELD_BLE_SYNC
++
++#include <atomic>
++#include <cstdint>
++#include <deque>
++#include <memory>
++#include <mutex>
++#include <string>
++
++#include "FieldSyncFraming.h"
++#include "FieldSyncRelay.h"
++
++namespace fieldsync {
++
++// The reader's GATT peripheral for Field Sync (ble-sync/PROTOCOL.md). It owns
++// the NimBLE stack from start() to stop(): the Bluetooth page turner must be
++// stopped first, and nothing else may start NimBLE meanwhile.
++//
++// Threads: start, poll, stop, sendBye and the RelayLink calls run on one task
++// (the main loop). NimBLE callbacks run on the NimBLE host task and only touch
++// the atomics and the inbox below.
++class BlePeripheral final : public RelayLink {
++ public:
++  static constexpr uint32_t ADVERTISE_TIMEOUT_MS = 60000;
++  static constexpr uint16_t PREFERRED_MTU = 247;
++
++  enum class Phase : uint8_t {
++    Off,
++    Advertising,  // waiting for the phone
++    Connected,    // phone linked; pairing and hello pending
++    Ready,        // encrypted, bonded, hello exchanged: requests may flow
++    TimedOut,     // no phone within ADVERTISE_TIMEOUT_MS
++    Failed,       // see failure()
++  };
++  enum class Failure : uint8_t { None, StackStart, Version, Oversize, PhoneLeft, Insecure };
++
++  BlePeripheral();
++  ~BlePeripheral() override;
++  BlePeripheral(const BlePeripheral&) = delete;
++  BlePeripheral& operator=(const BlePeripheral&) = delete;
++
++  // Starts NimBLE, the service and advertising. False when the stack was
++  // already up (another owner) or failed to start.
++  bool start(const std::string& baseUrl, const char* firmware);
++  // Drives the handshake and the advertising timeout. Call every loop pass.
++  Phase poll();
++  Phase phase() const { return currentPhase; }
++  Failure failure() const { return currentFailure; }
++  // The pairing passkey to show (0..999999), or -1 when none is pending.
++  int32_t passkey() const { return pairingPasskey.load(std::memory_order_acquire); }
++  const std::string& deviceName() const { return name; }
++
++  // Sends {"t":"bye"} when the link is ready. Then call stop().
++  void sendBye(const char* reason);
++  // Disconnects, stops advertising and releases the NimBLE host and controller.
++  // Idempotent; call from the task that called start().
++  void stop();
++
++  bool send(const std::string& message) override;
++  Wait receive(std::string& out, uint32_t timeoutMs) override;
++  uint32_t nowMs() override;
++
++  // NimBLE host task entry points (see FieldBlePeripheral.cpp).
++  struct Callbacks;
++
++ private:
++  void restartAdvertising();
++  void fail(Failure failure);
++  bool takeMessage(std::string& out);
++  void handshake();
++
++  std::unique_ptr<Callbacks> callbacks;
++  std::string name;
++  std::string baseUrl;
++  std::string firmware;
++  Phase currentPhase = Phase::Off;
++  Failure currentFailure = Failure::None;
++  uint32_t advertiseStartMs = 0;
++  uint8_t nextMsgId = 0;
++  bool running = false;
++
++  // Written by the NimBLE host task.
++  std::atomic<uint16_t> connHandle;
++  std::atomic<uint16_t> mtu{MIN_ATT_MTU};
++  std::atomic<bool> secure{false};
++  std::atomic<bool> peerLeft{false};
++  std::atomic<bool> oversize{false};
++  std::atomic<int32_t> pairingPasskey{-1};
++  Reassembler rx;  // host task only
++  std::mutex inboxLock;
++  std::deque<std::string> inbox;
++};
++
++}  // namespace fieldsync
++
++#endif
+diff --git a/lib/FieldBleSync/include/FieldSyncFraming.h b/lib/FieldBleSync/include/FieldSyncFraming.h
+new file mode 100644
+index 0000000..0fee334
+--- /dev/null
++++ b/lib/FieldBleSync/include/FieldSyncFraming.h
+@@ -0,0 +1,55 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <string>
++
++// Chunk framing of the Field Sync relay (ble-sync/PROTOCOL.md, "Framing"):
++// byte 0 flags (bit0 FIRST, bit1 LAST), byte 1 msgId, then payload bytes.
++namespace fieldsync {
++
++inline constexpr uint8_t FLAG_FIRST = 0x01;
++inline constexpr uint8_t FLAG_LAST = 0x02;
++inline constexpr size_t HEADER_BYTES = 2;
++inline constexpr uint16_t MIN_ATT_MTU = 23;
++inline constexpr size_t MAX_MESSAGE_BYTES = 16384;
++inline constexpr uint32_t CHUNK_GAP_TIMEOUT_MS = 5000;
++
++// Largest chunk for an ATT MTU (MTU - 3), never below the 23-byte minimum.
++size_t chunkSizeForMtu(uint16_t mtu);
++
++// Receives one encoded chunk; false stops the encoding.
++using ChunkSink = bool (*)(const uint8_t* chunk, size_t length, void* context);
++
++// Splits one message into chunks of at most chunkSizeForMtu(mtu) bytes and hands
++// each to sink. False when the message is over MAX_MESSAGE_BYTES or sink failed.
++bool encodeMessage(uint8_t msgId, const uint8_t* message, size_t length, uint16_t mtu, ChunkSink sink, void* context);
++
++// Rebuilds messages from chunks of one characteristic. Raw bytes are kept until
++// the LAST chunk, so a UTF-8 sequence split across chunks stays intact.
++class Reassembler {
++ public:
++  enum class Result : uint8_t {
++    Partial,   // chunk stored; the message continues
++    Complete,  // message() holds a whole message until the next feed()
++    Ignored,   // not part of a message in progress (malformed, stale or unknown msgId)
++    TooLarge,  // the message passed MAX_MESSAGE_BYTES and was dropped
++  };
++
++  Result feed(const uint8_t* chunk, size_t length, uint32_t nowMs);
++  // Drops a partial message once CHUNK_GAP_TIMEOUT_MS passed since its last chunk.
++  // True when one was dropped.
++  bool expire(uint32_t nowMs);
++  void reset();
++
++  const std::string& message() const { return buffer; }
++  bool inProgress() const { return active; }
++
++ private:
++  std::string buffer;
++  bool active = false;
++  uint8_t msgId = 0;
++  uint32_t lastChunkMs = 0;
++};
++
++}  // namespace fieldsync
+diff --git a/lib/FieldBleSync/include/FieldSyncMessages.h b/lib/FieldBleSync/include/FieldSyncMessages.h
+new file mode 100644
+index 0000000..f8dbe5e
+--- /dev/null
++++ b/lib/FieldBleSync/include/FieldSyncMessages.h
+@@ -0,0 +1,39 @@
++#pragma once
++
++#include <cstdint>
++#include <string>
++
++#include "KOReaderSyncTransport.h"
++
++// JSON messages of the Field Sync relay (ble-sync/PROTOCOL.md, "Messages").
++namespace fieldsync {
++
++inline constexpr int PROTOCOL_VERSION = 1;
++
++std::string buildHello(const char* device, const char* firmware, const std::string& baseUrl);
++std::string buildRequest(uint16_t id, const KOSyncRequest& request);
++std::string buildBye(const char* reason);
++std::string buildError(const char* code, const char* message);
++
++enum class MessageType : uint8_t { Invalid, Unknown, Hello, Response, Bye, Error };
++
++// One message from the phone. Fields not used by its type stay at their defaults.
++struct Incoming {
++  MessageType type = MessageType::Invalid;
++  int version = 0;       // hello
++  uint32_t id = 0;       // res
++  int status = 0;        // res
++  bool hasBody = false;  // res: false when body was null or absent
++  std::string body;      // res
++  std::string error;     // res with status 0
++  std::string code;      // error
++  std::string text;      // error message, bye reason
++};
++
++// Invalid: not a JSON object with a string "t". Unknown: another "t".
++Incoming parseIncoming(const std::string& json);
++
++// True when a hello's major version matches PROTOCOL_VERSION.
++inline bool versionCompatible(const int version) { return version == PROTOCOL_VERSION; }
++
++}  // namespace fieldsync
+diff --git a/lib/FieldBleSync/include/FieldSyncRelay.h b/lib/FieldBleSync/include/FieldSyncRelay.h
+new file mode 100644
+index 0000000..9069ca3
+--- /dev/null
++++ b/lib/FieldBleSync/include/FieldSyncRelay.h
+@@ -0,0 +1,53 @@
++#pragma once
++
++#include <cstdint>
++#include <string>
++
++#include "KOReaderSyncTransport.h"
++
++namespace fieldsync {
++
++inline constexpr uint32_t RESPONSE_TIMEOUT_MS = 30000;
++
++// A message link to the phone: whole JSON messages, already framed and reassembled.
++class RelayLink {
++ public:
++  enum class Wait : uint8_t {
++    Message,  // out holds one complete message
++    Timeout,  // nothing arrived in time
++    Closed,   // the phone disconnected or the link failed (e.g. an oversize message)
++  };
++
++  virtual ~RelayLink() = default;
++  virtual bool send(const std::string& message) = 0;
++  // Waits at most timeoutMs for the next message from the phone.
++  virtual Wait receive(std::string& out, uint32_t timeoutMs) = 0;
++  virtual uint32_t nowMs() = 0;
++};
++
++// Carries KOSync requests to the phone as "req" messages and waits for the
++// matching "res". One request at a time; ids run 1..65535 and wrap.
++class RelayTransport final : public KOSyncTransport {
++ public:
++  explicit RelayTransport(RelayLink& link, uint32_t timeoutMs = RESPONSE_TIMEOUT_MS)
++      : link(link), timeoutMs(timeoutMs) {}
++
++  // HTTP status; 0 when the phone answered status 0 (it could not reach the
++  // server); -1 on timeout or a closed link. Both map to NETWORK_ERROR.
++  int perform(const KOSyncRequest& request, std::string* responseBody) override;
++
++  // The link is gone (phone left, sent bye/error, or oversize data): later
++  // requests fail at once.
++  bool closed() const { return linkClosed; }
++  // The phone's error code from the last failed request ("network", "timeout", ...), if any.
++  const std::string& lastError() const { return error; }
++
++ private:
++  RelayLink& link;
++  uint32_t timeoutMs;
++  uint16_t nextId = 1;
++  bool linkClosed = false;
++  std::string error;
++};
++
++}  // namespace fieldsync
+diff --git a/lib/FieldBleSync/library.json b/lib/FieldBleSync/library.json
+new file mode 100644
+index 0000000..efc9ec6
+--- /dev/null
++++ b/lib/FieldBleSync/library.json
+@@ -0,0 +1,11 @@
++{
++  "name": "FieldBleSync",
++  "version": "0.1.0",
++  "description": "Field Sync: relays KOReader sync requests to a phone over a BLE GATT peripheral.",
++  "build": {
++    "srcDir": "src",
++    "includeDir": "include"
++  },
++  "frameworks": "*",
++  "platforms": "*"
++}
+diff --git a/lib/FieldBleSync/src/FieldBlePeripheral.cpp b/lib/FieldBleSync/src/FieldBlePeripheral.cpp
+new file mode 100644
+index 0000000..7800c3b
+--- /dev/null
++++ b/lib/FieldBleSync/src/FieldBlePeripheral.cpp
+@@ -0,0 +1,338 @@
++#include "FieldBlePeripheral.h"
++
++#if defined(FIELD_BLE_SYNC) && FIELD_BLE_SYNC
++
++#include <Arduino.h>
++#include <Logging.h>
++#include <NimBLEDevice.h>
++#include <esp_random.h>
++
++#include <algorithm>
++#include <cctype>
++#include <utility>
++
++#include "FieldSyncMessages.h"
++
++namespace fieldsync {
++
++namespace {
++constexpr char SERVICE_UUID[] = "6f1d0001-5a1e-4c8b-9f3e-2b7c1a0e5d10";
++constexpr char RX_UUID[] = "6f1d0002-5a1e-4c8b-9f3e-2b7c1a0e5d10";
++constexpr char TX_UUID[] = "6f1d0003-5a1e-4c8b-9f3e-2b7c1a0e5d10";
++constexpr char DEVICE[] = "CrossPoint";
++// A request and its answer are in flight at once at most; more queued messages
++// mean a misbehaving phone, and the oldest are dropped.
++constexpr size_t INBOX_LIMIT = 4;
++// A notification that finds NimBLE's buffers full is retried for this long.
++constexpr uint32_t NOTIFY_RETRY_MS = 2000;
++// Time for the last notification (bye) to leave before the link is closed.
++constexpr uint32_t BYE_DRAIN_MS = 300;
++constexpr uint32_t DISCONNECT_WAIT_MS = 1000;
++}  // namespace
++
++struct BlePeripheral::Callbacks final : public NimBLEServerCallbacks, public NimBLECharacteristicCallbacks {
++  explicit Callbacks(BlePeripheral& owner) : owner(owner) {}
++
++  BlePeripheral& owner;
++  NimBLEServer* server = nullptr;
++  NimBLECharacteristic* tx = nullptr;
++
++  void onConnect(NimBLEServer*, NimBLEConnInfo& info) override {
++    owner.rx.reset();
++    owner.secure.store(false, std::memory_order_release);
++    owner.peerLeft.store(false, std::memory_order_release);
++    owner.mtu.store(std::max<uint16_t>(info.getMTU(), MIN_ATT_MTU), std::memory_order_release);
++    owner.connHandle.store(info.getConnHandle(), std::memory_order_release);
++    // A bonded phone re-encrypts here; a new one is asked to pair (passkey on screen).
++    NimBLEDevice::startSecurity(info.getConnHandle());
++  }
++
++  void onDisconnect(NimBLEServer*, NimBLEConnInfo& info, const int reason) override {
++    if (info.getConnHandle() != owner.connHandle.load(std::memory_order_acquire)) return;
++    LOG_DBG("FSYNC", "Phone disconnected (reason %d)", reason);
++    owner.connHandle.store(BLE_HS_CONN_HANDLE_NONE, std::memory_order_release);
++    owner.secure.store(false, std::memory_order_release);
++    owner.pairingPasskey.store(-1, std::memory_order_release);
++    owner.peerLeft.store(true, std::memory_order_release);
++  }
++
++  void onMTUChange(const uint16_t value, NimBLEConnInfo&) override {
++    owner.mtu.store(std::max<uint16_t>(value, MIN_ATT_MTU), std::memory_order_release);
++  }
++
++  uint32_t onPassKeyDisplay() override {
++    const auto key = static_cast<int32_t>(esp_random() % 1000000u);
++    owner.pairingPasskey.store(key, std::memory_order_release);
++    return static_cast<uint32_t>(key);
++  }
++
++  void onAuthenticationComplete(NimBLEConnInfo& info) override {
++    owner.pairingPasskey.store(-1, std::memory_order_release);
++    // Sync credentials travel over this link: refuse anything below an
++    // encrypted, MITM-authenticated, bonded link.
++    if (info.isEncrypted() && info.isAuthenticated() && info.isBonded()) {
++      owner.secure.store(true, std::memory_order_release);
++      return;
++    }
++    LOG_ERR("FSYNC", "Link not secure (enc=%d auth=%d bond=%d); disconnecting", info.isEncrypted(),
++            info.isAuthenticated(), info.isBonded());
++    if (server) server->disconnect(info.getConnHandle());
++  }
++
++  void onWrite(NimBLECharacteristic* characteristic, NimBLEConnInfo& info) override {
++    if (!owner.secure.load(std::memory_order_acquire) || !info.isEncrypted()) return;
++    const NimBLEAttValue value = characteristic->getValue();
++    switch (owner.rx.feed(value.data(), value.size(), millis())) {
++      case Reassembler::Result::Complete: {
++        std::lock_guard<std::mutex> lock(owner.inboxLock);
++        if (owner.inbox.size() >= INBOX_LIMIT) owner.inbox.pop_front();
++        owner.inbox.push_back(owner.rx.message());
++        break;
++      }
++      case Reassembler::Result::TooLarge:
++        owner.oversize.store(true, std::memory_order_release);
++        break;
++      default:
++        break;
++    }
++  }
++};
++
++BlePeripheral::BlePeripheral() : callbacks(new Callbacks(*this)), connHandle(BLE_HS_CONN_HANDLE_NONE) {}
++
++BlePeripheral::~BlePeripheral() { stop(); }
++
++uint32_t BlePeripheral::nowMs() { return millis(); }
++
++bool BlePeripheral::start(const std::string& serverBaseUrl, const char* firmwareVersion) {
++  if (running) return true;
++  if (NimBLEDevice::isInitialized()) {
++    LOG_ERR("FSYNC", "NimBLE already running; refusing to take it over");
++    return false;
++  }
++  baseUrl = serverBaseUrl;
++  firmware = firmwareVersion ? firmwareVersion : "";
++  currentFailure = Failure::None;
++
++  if (!NimBLEDevice::init("FieldSync")) {
++    LOG_ERR("FSYNC", "NimBLE init failed");
++    fail(Failure::StackStart);
++    return false;
++  }
++  running = true;
++
++  // FieldSync-XXXX: the last two address bytes, as printed "aa:bb:cc:dd:EE:FF".
++  std::string addr = NimBLEDevice::getAddress().toString();
++  std::string suffix;
++  for (size_t i = addr.size() >= 5 ? addr.size() - 5 : 0; i < addr.size(); ++i) {
++    if (addr[i] != ':') suffix.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(addr[i]))));
++  }
++  name = "FieldSync-" + suffix;
++  NimBLEDevice::setDeviceName(name);
++  NimBLEDevice::setMTU(PREFERRED_MTU);
++
++  // LE Secure Connections with MITM: the reader displays, the phone types.
++  NimBLEDevice::setSecurityAuth(/*bonding=*/true, /*mitm=*/true, /*sc=*/true);
++  NimBLEDevice::setSecurityIOCap(BLE_HS_IO_DISPLAY_ONLY);
++  // 123456 makes NimBLE ask onPassKeyDisplay() for a fresh key on each pairing.
++  NimBLEDevice::setSecurityPasskey(123456);
++  NimBLEDevice::setSecurityInitKey(BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID);
++  NimBLEDevice::setSecurityRespKey(BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID);
++
++  NimBLEServer* server = NimBLEDevice::createServer();
++  server->setCallbacks(callbacks.get(), false);
++  server->advertiseOnDisconnect(false);
++  NimBLEService* service = server->createService(SERVICE_UUID);
++  NimBLECharacteristic* rxChr =
++      service->createCharacteristic(RX_UUID, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR |
++                                                 NIMBLE_PROPERTY::WRITE_ENC | NIMBLE_PROPERTY::WRITE_AUTHEN);
++  rxChr->setCallbacks(callbacks.get());
++  callbacks->tx = service->createCharacteristic(TX_UUID, NIMBLE_PROPERTY::NOTIFY);
++  callbacks->server = server;
++  server->start();
++
++  NimBLEAdvertisementData advData;
++  advData.setFlags(BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP);
++  advData.addServiceUUID(NimBLEUUID(SERVICE_UUID));
++  NimBLEAdvertisementData scanData;
++  scanData.setName(name);
++  NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
++  adv->setAdvertisementData(advData);
++  adv->setScanResponseData(scanData);
++
++  restartAdvertising();
++  if (currentPhase != Phase::Advertising) {
++    stop();
++    fail(Failure::StackStart);
++    return false;
++  }
++  LOG_INF("FSYNC", "Advertising as %s", name.c_str());
++  return true;
++}
++
++void BlePeripheral::restartAdvertising() {
++  peerLeft.store(false, std::memory_order_release);
++  {
++    std::lock_guard<std::mutex> lock(inboxLock);
++    inbox.clear();
++  }
++  advertiseStartMs = millis();
++  if (NimBLEDevice::getAdvertising()->start(ADVERTISE_TIMEOUT_MS)) {
++    currentPhase = Phase::Advertising;
++  } else {
++    LOG_ERR("FSYNC", "Advertising start failed");
++    fail(Failure::StackStart);
++  }
++}
++
++void BlePeripheral::fail(const Failure failure) {
++  currentFailure = failure;
++  currentPhase = Phase::Failed;
++}
++
++bool BlePeripheral::takeMessage(std::string& out) {
++  std::lock_guard<std::mutex> lock(inboxLock);
++  if (inbox.empty()) return false;
++  out = std::move(inbox.front());
++  inbox.pop_front();
++  return true;
++}
++
++void BlePeripheral::handshake() {
++  if (!secure.load(std::memory_order_acquire)) return;
++  std::string message;
++  while (takeMessage(message)) {
++    const Incoming in = parseIncoming(message);
++    if (in.type != MessageType::Hello) continue;  // nothing else is valid before hello
++    if (!versionCompatible(in.version)) {
++      LOG_ERR("FSYNC", "Phone protocol v%d, reader v%d", in.version, PROTOCOL_VERSION);
++      send(buildError("version", nullptr));
++      fail(Failure::Version);
++      return;
++    }
++    if (!send(buildHello(DEVICE, firmware.c_str(), baseUrl))) return;  // the link dropped; poll() sees it
++    LOG_INF("FSYNC", "Phone ready (MTU %u)", mtu.load());
++    currentPhase = Phase::Ready;
++    return;
++  }
++}
++
++BlePeripheral::Phase BlePeripheral::poll() {
++  if (!running) return currentPhase;
++  if (oversize.load(std::memory_order_acquire)) {
++    LOG_ERR("FSYNC", "Phone sent a message over %u bytes", static_cast<unsigned>(MAX_MESSAGE_BYTES));
++    send(buildError("too_large", nullptr));
++    fail(Failure::Oversize);
++    return currentPhase;
++  }
++  const bool linked = connHandle.load(std::memory_order_acquire) != BLE_HS_CONN_HANDLE_NONE;
++  switch (currentPhase) {
++    case Phase::Advertising:
++      if (linked) {
++        currentPhase = Phase::Connected;
++      } else if (millis() - advertiseStartMs >= ADVERTISE_TIMEOUT_MS) {
++        NimBLEDevice::getAdvertising()->stop();
++        currentPhase = Phase::TimedOut;
++      }
++      break;
++    case Phase::Connected:
++      // A phone that leaves before the hello (pairing cancelled, wrong passkey)
++      // may try again: advertise for a fresh window.
++      if (peerLeft.load(std::memory_order_acquire)) {
++        restartAdvertising();
++        break;
++      }
++      handshake();
++      break;
++    case Phase::Ready:
++      if (peerLeft.load(std::memory_order_acquire)) fail(Failure::PhoneLeft);
++      break;
++    default:
++      break;
++  }
++  return currentPhase;
++}
++
++namespace {
++struct NotifyTarget {
++  NimBLECharacteristic* tx;
++  uint16_t conn;
++};
++
++bool notifyChunk(const uint8_t* chunk, const size_t length, void* context) {
++  const auto* target = static_cast<NotifyTarget*>(context);
++  const uint32_t startMs = millis();
++  // notify() fails while NimBLE's mbuf pool is full; it drains as packets leave.
++  while (!target->tx->notify(chunk, length, target->conn)) {
++    if (millis() - startMs >= NOTIFY_RETRY_MS) return false;
++    delay(5);
++  }
++  return true;
++}
++}  // namespace
++
++bool BlePeripheral::send(const std::string& message) {
++  const uint16_t conn = connHandle.load(std::memory_order_acquire);
++  if (!running || conn == BLE_HS_CONN_HANDLE_NONE || !secure.load(std::memory_order_acquire) || !callbacks->tx) {
++    return false;
++  }
++  NotifyTarget target{callbacks->tx, conn};
++  if (!encodeMessage(nextMsgId++, reinterpret_cast<const uint8_t*>(message.data()), message.size(),
++                     mtu.load(std::memory_order_acquire), notifyChunk, &target)) {
++    LOG_ERR("FSYNC", "Send of %u bytes failed", static_cast<unsigned>(message.size()));
++    return false;
++  }
++  return true;
++}
++
++RelayLink::Wait BlePeripheral::receive(std::string& out, const uint32_t timeoutMs) {
++  const uint32_t startMs = millis();
++  for (;;) {
++    if (takeMessage(out)) return Wait::Message;
++    if (!running || peerLeft.load(std::memory_order_acquire) || oversize.load(std::memory_order_acquire)) {
++      return Wait::Closed;
++    }
++    if (millis() - startMs >= timeoutMs) return Wait::Timeout;
++    delay(10);
++  }
++}
++
++void BlePeripheral::sendBye(const char* reason) {
++  if (!running || connHandle.load(std::memory_order_acquire) == BLE_HS_CONN_HANDLE_NONE) return;
++  if (send(buildBye(reason))) delay(BYE_DRAIN_MS);
++}
++
++void BlePeripheral::stop() {
++  if (!running) return;
++  running = false;
++  const uint16_t conn = connHandle.load(std::memory_order_acquire);
++  if (conn != BLE_HS_CONN_HANDLE_NONE && callbacks->server) {
++    callbacks->server->disconnect(conn);
++    const uint32_t startMs = millis();
++    while (connHandle.load(std::memory_order_acquire) != BLE_HS_CONN_HANDLE_NONE &&
++           millis() - startMs < DISCONNECT_WAIT_MS) {
++      delay(10);
++    }
++  }
++  NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
++  if (adv && adv->isAdvertising()) adv->stop();
++  callbacks->tx = nullptr;
++  callbacks->server = nullptr;
++  // Frees the NimBLE host and controller; the bond stays in NVS.
++  NimBLEDevice::deinit(true);
++  if (NimBLEDevice::isInitialized()) LOG_ERR("FSYNC", "NimBLE deinit did not complete");
++  connHandle.store(BLE_HS_CONN_HANDLE_NONE, std::memory_order_release);
++  secure.store(false, std::memory_order_release);
++  pairingPasskey.store(-1, std::memory_order_release);
++  rx.reset();
++  {
++    std::lock_guard<std::mutex> lock(inboxLock);
++    inbox.clear();
++  }
++  if (currentPhase != Phase::Failed && currentPhase != Phase::TimedOut) currentPhase = Phase::Off;
++  LOG_DBG("FSYNC", "Bluetooth stopped (heap: %u)", static_cast<unsigned>(ESP.getFreeHeap()));
++}
++
++}  // namespace fieldsync
++
++#endif
+diff --git a/lib/FieldBleSync/src/FieldSyncFraming.cpp b/lib/FieldBleSync/src/FieldSyncFraming.cpp
+new file mode 100644
+index 0000000..2c04600
+--- /dev/null
++++ b/lib/FieldBleSync/src/FieldSyncFraming.cpp
+@@ -0,0 +1,76 @@
++#include "FieldSyncFraming.h"
++
++#include <algorithm>
++
++namespace fieldsync {
++
++size_t chunkSizeForMtu(const uint16_t mtu) { return static_cast<size_t>(std::max(mtu, MIN_ATT_MTU)) - 3; }
++
++bool encodeMessage(const uint8_t msgId, const uint8_t* message, const size_t length, const uint16_t mtu,
++                   const ChunkSink sink, void* context) {
++  if (length > MAX_MESSAGE_BYTES || sink == nullptr) return false;
++  const size_t payloadMax = chunkSizeForMtu(mtu) - HEADER_BYTES;
++  uint8_t chunk[HEADER_BYTES + 512];
++  const size_t payloadCap = std::min(payloadMax, sizeof(chunk) - HEADER_BYTES);
++  size_t offset = 0;
++  do {
++    const size_t take = std::min(payloadCap, length - offset);
++    uint8_t flags = 0;
++    if (offset == 0) flags |= FLAG_FIRST;
++    if (offset + take == length) flags |= FLAG_LAST;
++    chunk[0] = flags;
++    chunk[1] = msgId;
++    if (take > 0) std::copy(message + offset, message + offset + take, chunk + HEADER_BYTES);
++    if (!sink(chunk, HEADER_BYTES + take, context)) return false;
++    offset += take;
++  } while (offset < length);
++  return true;
++}
++
++Reassembler::Result Reassembler::feed(const uint8_t* chunk, const size_t length, const uint32_t nowMs) {
++  if (chunk == nullptr || length < HEADER_BYTES) return Result::Ignored;
++  const uint8_t flags = chunk[0];
++  const uint8_t id = chunk[1];
++  const uint8_t* payload = chunk + HEADER_BYTES;
++  const size_t payloadLength = length - HEADER_BYTES;
++
++  if (flags & FLAG_FIRST) {
++    // FIRST discards whatever was partially received.
++    buffer.clear();
++    active = true;
++    msgId = id;
++  } else {
++    expire(nowMs);
++    if (!active || id != msgId) {
++      reset();
++      return Result::Ignored;
++    }
++  }
++
++  if (buffer.size() + payloadLength > MAX_MESSAGE_BYTES) {
++    reset();
++    return Result::TooLarge;
++  }
++  buffer.append(reinterpret_cast<const char*>(payload), payloadLength);
++  lastChunkMs = nowMs;
++
++  if (flags & FLAG_LAST) {
++    active = false;
++    return Result::Complete;
++  }
++  return Result::Partial;
++}
++
++bool Reassembler::expire(const uint32_t nowMs) {
++  if (!active || nowMs - lastChunkMs <= CHUNK_GAP_TIMEOUT_MS) return false;
++  reset();
++  return true;
++}
++
++void Reassembler::reset() {
++  // Release the storage too: a dropped 16 KB message should not stay allocated.
++  std::string().swap(buffer);
++  active = false;
++}
++
++}  // namespace fieldsync
+diff --git a/lib/FieldBleSync/src/FieldSyncMessages.cpp b/lib/FieldBleSync/src/FieldSyncMessages.cpp
+new file mode 100644
+index 0000000..6797d96
+--- /dev/null
++++ b/lib/FieldBleSync/src/FieldSyncMessages.cpp
+@@ -0,0 +1,115 @@
++#include "FieldSyncMessages.h"
++
++#include <ArduinoJson.h>
++
++namespace fieldsync {
++
++namespace {
++// ArduinoJson writes control characters other than \b \f \n \r \t raw, which
++// JSON.parse() on the phone rejects. Outside strings JSON has none, so every one
++// left is inside a string and becomes a \u00XX escape.
++std::string serialize(const JsonDocument& doc) {
++  std::string raw;
++  serializeJson(doc, raw);
++  size_t controls = 0;
++  for (const char c : raw) controls += static_cast<unsigned char>(c) < 0x20 ? 1 : 0;
++  if (controls == 0) return raw;
++  static constexpr char HEX_DIGITS[] = "0123456789abcdef";
++  std::string out;
++  out.reserve(raw.size() + controls * 5);
++  for (const char c : raw) {
++    const auto byte = static_cast<unsigned char>(c);
++    if (byte >= 0x20) {
++      out.push_back(c);
++      continue;
++    }
++    out.append("\\u00");
++    out.push_back(HEX_DIGITS[byte >> 4]);
++    out.push_back(HEX_DIGITS[byte & 0x0F]);
++  }
++  return out;
++}
++}  // namespace
++
++std::string buildHello(const char* device, const char* firmware, const std::string& baseUrl) {
++  JsonDocument doc;
++  doc["t"] = "hello";
++  doc["v"] = PROTOCOL_VERSION;
++  doc["device"] = device;
++  doc["fw"] = firmware;
++  doc["baseUrl"] = baseUrl;
++  return serialize(doc);
++}
++
++std::string buildRequest(const uint16_t id, const KOSyncRequest& request) {
++  JsonDocument doc;
++  doc["t"] = "req";
++  doc["id"] = id;
++  doc["method"] = request.method;
++  doc["path"] = request.path;
++  JsonObject headers = doc["headers"].to<JsonObject>();
++  for (const auto& header : request.headers) headers[header.first] = header.second;
++  if (request.body) {
++    doc["body"] = *request.body;
++  } else {
++    doc["body"] = nullptr;
++  }
++  return serialize(doc);
++}
++
++std::string buildBye(const char* reason) {
++  JsonDocument doc;
++  doc["t"] = "bye";
++  doc["reason"] = reason;
++  return serialize(doc);
++}
++
++std::string buildError(const char* code, const char* message) {
++  JsonDocument doc;
++  doc["t"] = "error";
++  doc["code"] = code;
++  if (message && message[0] != '\0') doc["message"] = message;
++  return serialize(doc);
++}
++
++Incoming parseIncoming(const std::string& json) {
++  Incoming in;
++  JsonDocument doc;
++  if (deserializeJson(doc, json) != DeserializationError::Ok || !doc.is<JsonObjectConst>()) return in;
++  const char* t = doc["t"].as<const char*>();
++  if (t == nullptr) return in;
++  const std::string type(t);
++
++  if (type == "hello") {
++    in.type = MessageType::Hello;
++    in.version = doc["v"].is<int>() ? doc["v"].as<int>() : 0;
++  } else if (type == "res") {
++    in.type = MessageType::Response;
++    const JsonVariantConst id = doc["id"];
++    const JsonVariantConst status = doc["status"];
++    // A res without a numeric id and status cannot be matched or mapped.
++    if (!id.is<uint32_t>() || !status.is<int>()) {
++      in.type = MessageType::Invalid;
++      return in;
++    }
++    in.id = id.as<uint32_t>();
++    in.status = status.as<int>();
++    if (doc["body"].is<const char*>()) {
++      in.hasBody = true;
++      in.body = doc["body"].as<const char*>();
++    }
++    if (doc["error"].is<const char*>()) in.error = doc["error"].as<const char*>();
++  } else if (type == "bye") {
++    in.type = MessageType::Bye;
++    if (doc["reason"].is<const char*>()) in.text = doc["reason"].as<const char*>();
++  } else if (type == "error") {
++    in.type = MessageType::Error;
++    if (doc["code"].is<const char*>()) in.code = doc["code"].as<const char*>();
++    if (doc["message"].is<const char*>()) in.text = doc["message"].as<const char*>();
++  } else {
++    in.type = MessageType::Unknown;
++  }
++  return in;
++}
++
++}  // namespace fieldsync
+diff --git a/lib/FieldBleSync/src/FieldSyncRelay.cpp b/lib/FieldBleSync/src/FieldSyncRelay.cpp
+new file mode 100644
+index 0000000..f2ee30f
+--- /dev/null
++++ b/lib/FieldBleSync/src/FieldSyncRelay.cpp
+@@ -0,0 +1,65 @@
++#include "FieldSyncRelay.h"
++
++#include <utility>
++
++#include "FieldSyncMessages.h"
++
++namespace fieldsync {
++
++int RelayTransport::perform(const KOSyncRequest& request, std::string* responseBody) {
++  error.clear();
++  if (responseBody) responseBody->clear();
++  if (linkClosed) {
++    error = "closed";
++    return -1;
++  }
++
++  const uint16_t id = nextId;
++  nextId = nextId == UINT16_MAX ? 1 : static_cast<uint16_t>(nextId + 1);
++  if (!link.send(buildRequest(id, request))) {
++    error = "send";
++    return -1;
++  }
++
++  const uint32_t startMs = link.nowMs();
++  std::string message;
++  for (;;) {
++    const uint32_t elapsed = link.nowMs() - startMs;
++    if (elapsed >= timeoutMs) {
++      error = "timeout";
++      return -1;
++    }
++    switch (link.receive(message, timeoutMs - elapsed)) {
++      case RelayLink::Wait::Timeout:
++        continue;  // the loop head ends the wait once the budget is spent
++      case RelayLink::Wait::Closed:
++        linkClosed = true;
++        error = "closed";
++        return -1;
++      case RelayLink::Wait::Message:
++        break;
++    }
++
++    Incoming in = parseIncoming(message);
++    switch (in.type) {
++      case MessageType::Response:
++        // A late answer to an earlier, timed-out request is dropped.
++        if (in.id != id) continue;
++        if (in.status <= 0) {
++          error = in.error.empty() ? "network" : in.error;
++          return 0;
++        }
++        if (responseBody && in.hasBody) *responseBody = std::move(in.body);
++        return in.status;
++      case MessageType::Bye:
++      case MessageType::Error:
++        linkClosed = true;
++        error = in.type == MessageType::Bye ? "bye" : (in.code.empty() ? "error" : in.code);
++        return -1;
++      default:
++        continue;  // hello repeats, unknown types and malformed JSON do not answer this request
++    }
++  }
++}
++
++}  // namespace fieldsync
+diff --git a/lib/FieldBleSync/test/CMakeLists.txt b/lib/FieldBleSync/test/CMakeLists.txt
+new file mode 100644
+index 0000000..ff4a531
+--- /dev/null
++++ b/lib/FieldBleSync/test/CMakeLists.txt
+@@ -0,0 +1,47 @@
++# Host tests for the Field Sync relay: framing, messages and the relay transport.
++# Runs from the firmware host suite (test/CMakeLists.txt) or on its own:
++# cmake -S lib/FieldBleSync/test -B build/fs && cmake --build build/fs && ctest --test-dir build/fs
++cmake_minimum_required(VERSION 3.16)
++project(field_ble_sync_tests CXX)
++
++if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
++  set(CMAKE_CXX_STANDARD 20)
++  set(CMAKE_CXX_STANDARD_REQUIRED ON)
++  set(CMAKE_CXX_EXTENSIONS OFF)
++  enable_testing()
++endif()
++
++include(FetchContent)
++if(NOT TARGET GTest::gtest_main)
++  FetchContent_Declare(googletest GIT_REPOSITORY https://github.com/google/googletest.git GIT_TAG v1.17.0)
++  set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
++  set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
++  set(BUILD_GMOCK OFF CACHE BOOL "" FORCE)
++  FetchContent_MakeAvailable(googletest)
++endif()
++include(GoogleTest)
++
++# ArduinoJson at the version the firmware pins (platformio.ini: bblanchon/ArduinoJson @ 7.4.2).
++FetchContent_Declare(arduinojson GIT_REPOSITORY https://github.com/bblanchon/ArduinoJson.git GIT_TAG v7.4.2
++                     SOURCE_SUBDIR no-build)
++FetchContent_MakeAvailable(arduinojson)
++
++get_filename_component(FIELDSYNC_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
++
++add_executable(FieldBleSyncTest
++  FramingTest.cpp
++  MessagesTest.cpp
++  RelayTransportTest.cpp
++  ${FIELDSYNC_ROOT}/src/FieldSyncFraming.cpp
++  ${FIELDSYNC_ROOT}/src/FieldSyncMessages.cpp
++  ${FIELDSYNC_ROOT}/src/FieldSyncRelay.cpp
++)
++target_include_directories(FieldBleSyncTest PRIVATE
++  ${FIELDSYNC_ROOT}/include
++  ${FIELDSYNC_ROOT}/../KOReaderSync
++)
++target_include_directories(FieldBleSyncTest SYSTEM PRIVATE ${arduinojson_SOURCE_DIR}/src)
++target_compile_definitions(FieldBleSyncTest PRIVATE FIELDSYNC_VECTORS_PATH="${FIELDSYNC_ROOT}/test/vectors.json")
++target_compile_options(FieldBleSyncTest PRIVATE -Wall -Wextra -Werror)
++target_link_libraries(FieldBleSyncTest PRIVATE GTest::gtest_main)
++gtest_discover_tests(FieldBleSyncTest)
+diff --git a/lib/FieldBleSync/test/FramingTest.cpp b/lib/FieldBleSync/test/FramingTest.cpp
+new file mode 100644
+index 0000000..ecf11e5
+--- /dev/null
++++ b/lib/FieldBleSync/test/FramingTest.cpp
+@@ -0,0 +1,225 @@
++#include <ArduinoJson.h>
++#include <gtest/gtest.h>
++
++#include <fstream>
++#include <sstream>
++#include <string>
++#include <vector>
++
++#include "FieldSyncFraming.h"
++
++using fieldsync::Reassembler;
++
++namespace {
++
++std::string toHex(const std::vector<uint8_t>& bytes) {
++  static const char* digits = "0123456789abcdef";
++  std::string out;
++  for (const uint8_t b : bytes) {
++    out.push_back(digits[b >> 4]);
++    out.push_back(digits[b & 0x0F]);
++  }
++  return out;
++}
++
++std::vector<uint8_t> fromHex(const std::string& hex) {
++  std::vector<uint8_t> out;
++  for (size_t i = 0; i + 1 < hex.size(); i += 2)
++    out.push_back(static_cast<uint8_t>(std::stoul(hex.substr(i, 2), nullptr, 16)));
++  return out;
++}
++
++bool collect(const uint8_t* chunk, const size_t length, void* context) {
++  static_cast<std::vector<std::vector<uint8_t>>*>(context)->emplace_back(chunk, chunk + length);
++  return true;
++}
++
++std::vector<std::vector<uint8_t>> encode(const std::string& message, const uint8_t msgId, const uint16_t mtu) {
++  std::vector<std::vector<uint8_t>> chunks;
++  EXPECT_TRUE(fieldsync::encodeMessage(msgId, reinterpret_cast<const uint8_t*>(message.data()), message.size(), mtu,
++                                       collect, &chunks));
++  return chunks;
++}
++
++struct Vector {
++  std::string name;
++  std::string message;
++  uint8_t msgId;
++  uint16_t mtu;
++  std::vector<std::string> chunks;
++};
++
++std::vector<Vector> loadVectors() {
++  std::ifstream file(FIELDSYNC_VECTORS_PATH);
++  std::stringstream text;
++  text << file.rdbuf();
++  JsonDocument doc;
++  EXPECT_EQ(deserializeJson(doc, text.str()), DeserializationError::Ok);
++  EXPECT_EQ(doc["protocol"].as<int>(), 1);
++  EXPECT_EQ(doc["maxMessageBytes"].as<size_t>(), fieldsync::MAX_MESSAGE_BYTES);
++  std::vector<Vector> out;
++  for (JsonObjectConst v : doc["framing"].as<JsonArrayConst>()) {
++    Vector vec;
++    vec.name = v["name"].as<const char*>();
++    vec.message = v["message"].as<const char*>();
++    vec.msgId = v["msgId"].as<uint8_t>();
++    vec.mtu = v["mtu"].as<uint16_t>();
++    for (JsonVariantConst c : v["chunks"].as<JsonArrayConst>()) vec.chunks.emplace_back(c.as<const char*>());
++    out.push_back(std::move(vec));
++  }
++  return out;
++}
++
++}  // namespace
++
++TEST(FieldSyncFraming, VectorsFileHasCases) { EXPECT_EQ(loadVectors().size(), 4u); }
++
++TEST(FieldSyncFraming, EncodesEveryVectorByteForByte) {
++  for (const auto& v : loadVectors()) {
++    SCOPED_TRACE(v.name);
++    const auto chunks = encode(v.message, v.msgId, v.mtu);
++    ASSERT_EQ(chunks.size(), v.chunks.size());
++    for (size_t i = 0; i < chunks.size(); ++i) {
++      EXPECT_EQ(toHex(chunks[i]), v.chunks[i]) << "chunk " << i;
++      EXPECT_LE(chunks[i].size(), fieldsync::chunkSizeForMtu(v.mtu));
++    }
++  }
++}
++
++TEST(FieldSyncFraming, DecodesEveryVectorBackToItsMessage) {
++  for (const auto& v : loadVectors()) {
++    SCOPED_TRACE(v.name);
++    Reassembler r;
++    for (size_t i = 0; i < v.chunks.size(); ++i) {
++      const auto bytes = fromHex(v.chunks[i]);
++      const auto result = r.feed(bytes.data(), bytes.size(), static_cast<uint32_t>(i * 10));
++      if (i + 1 < v.chunks.size()) {
++        EXPECT_EQ(result, Reassembler::Result::Partial);
++      } else {
++        ASSERT_EQ(result, Reassembler::Result::Complete);
++      }
++    }
++    EXPECT_EQ(r.message(), v.message);
++  }
++}
++
++TEST(FieldSyncFraming, MinimumMtuGivesEighteenBytePayloads) {
++  EXPECT_EQ(fieldsync::chunkSizeForMtu(23), 20u);
++  EXPECT_EQ(fieldsync::chunkSizeForMtu(0), 20u);  // never below the minimum MTU
++  EXPECT_EQ(fieldsync::chunkSizeForMtu(247), 244u);
++}
++
++TEST(FieldSyncFraming, LargeMtuStillBoundsChunks) {
++  const std::string message(5000, 'x');
++  const auto chunks = encode(message, 1, 517);
++  for (const auto& c : chunks) EXPECT_LE(c.size(), 514u);
++  Reassembler r;
++  Reassembler::Result last = Reassembler::Result::Ignored;
++  for (const auto& c : chunks) last = r.feed(c.data(), c.size(), 0);
++  ASSERT_EQ(last, Reassembler::Result::Complete);
++  EXPECT_EQ(r.message(), message);
++}
++
++TEST(FieldSyncFraming, EncoderRefusesOversizeMessages) {
++  const std::string atLimit(fieldsync::MAX_MESSAGE_BYTES, 'a');
++  EXPECT_FALSE(encode(atLimit, 0, 247).empty());
++  const std::string over(fieldsync::MAX_MESSAGE_BYTES + 1, 'a');
++  std::vector<std::vector<uint8_t>> chunks;
++  EXPECT_FALSE(
++      fieldsync::encodeMessage(0, reinterpret_cast<const uint8_t*>(over.data()), over.size(), 247, collect, &chunks));
++  EXPECT_TRUE(chunks.empty());
++}
++
++TEST(FieldSyncFraming, ReassemblesExactlyTheLimitButDropsOneByteMore) {
++  {
++    const std::string atLimit(fieldsync::MAX_MESSAGE_BYTES, 'a');
++    Reassembler r;
++    Reassembler::Result last = Reassembler::Result::Ignored;
++    for (const auto& c : encode(atLimit, 3, 247)) last = r.feed(c.data(), c.size(), 0);
++    EXPECT_EQ(last, Reassembler::Result::Complete);
++    EXPECT_EQ(r.message().size(), fieldsync::MAX_MESSAGE_BYTES);
++  }
++  {
++    // Hand-built chunks: the encoder itself refuses to produce this message.
++    Reassembler r;
++    std::vector<uint8_t> chunk(2 + 200, 'b');
++    chunk[1] = 9;
++    Reassembler::Result result = Reassembler::Result::Partial;
++    size_t sent = 0;
++    bool first = true;
++    while (result == Reassembler::Result::Partial) {
++      chunk[0] = first ? fieldsync::FLAG_FIRST : 0;
++      first = false;
++      result = r.feed(chunk.data(), chunk.size(), 0);
++      sent += 200;
++    }
++    EXPECT_EQ(result, Reassembler::Result::TooLarge);
++    EXPECT_GT(sent, fieldsync::MAX_MESSAGE_BYTES);
++    EXPECT_FALSE(r.inProgress());
++    // The rest of the dropped message is ignored, even its LAST chunk.
++    chunk[0] = fieldsync::FLAG_LAST;
++    EXPECT_EQ(r.feed(chunk.data(), chunk.size(), 0), Reassembler::Result::Ignored);
++  }
++}
++
++TEST(FieldSyncFraming, GapOverFiveSecondsDiscardsThePartialMessage) {
++  const auto chunks = encode("{\"t\":\"hello\",\"v\":1,\"app\":\"field-sync-web\"}", 4, 23);
++  ASSERT_GE(chunks.size(), 3u);
++  Reassembler r;
++  EXPECT_EQ(r.feed(chunks[0].data(), chunks[0].size(), 1000), Reassembler::Result::Partial);
++  EXPECT_EQ(r.feed(chunks[1].data(), chunks[1].size(), 6000), Reassembler::Result::Partial);  // exactly 5 s: kept
++  EXPECT_EQ(r.feed(chunks[2].data(), chunks[2].size(), 11001), Reassembler::Result::Ignored);
++  EXPECT_FALSE(r.inProgress());
++}
++
++TEST(FieldSyncFraming, ExpireDropsStalePartialWithoutAChunk) {
++  const auto chunks = encode(std::string(100, 'z'), 4, 23);
++  Reassembler r;
++  r.feed(chunks[0].data(), chunks[0].size(), 0);
++  EXPECT_FALSE(r.expire(5000));
++  EXPECT_TRUE(r.inProgress());
++  EXPECT_TRUE(r.expire(5001));
++  EXPECT_FALSE(r.inProgress());
++}
++
++TEST(FieldSyncFraming, FirstChunkResetsAPartialMessage) {
++  const auto stale = encode(std::string(60, 's'), 1, 23);
++  const auto fresh = encode("{\"t\":\"bye\",\"r\":1}", 2, 23);
++  Reassembler r;
++  EXPECT_EQ(r.feed(stale[0].data(), stale[0].size(), 0), Reassembler::Result::Partial);
++  EXPECT_EQ(r.feed(stale[1].data(), stale[1].size(), 0), Reassembler::Result::Partial);
++  ASSERT_EQ(fresh.size(), 1u);
++  EXPECT_EQ(r.feed(fresh[0].data(), fresh[0].size(), 0), Reassembler::Result::Complete);
++  EXPECT_EQ(r.message(), "{\"t\":\"bye\",\"r\":1}");
++  // FIRST with the same msgId as the partial one also starts over.
++  const auto again = encode(std::string(60, 'q'), 1, 23);
++  r.feed(stale[0].data(), stale[0].size(), 0);
++  Reassembler::Result last = Reassembler::Result::Ignored;
++  for (const auto& c : again) last = r.feed(c.data(), c.size(), 0);
++  EXPECT_EQ(last, Reassembler::Result::Complete);
++  EXPECT_EQ(r.message(), std::string(60, 'q'));
++}
++
++TEST(FieldSyncFraming, IgnoresOrphanAndMismatchedChunks) {
++  Reassembler r;
++  const uint8_t orphan[] = {0x02, 0x05, 'x'};
++  EXPECT_EQ(r.feed(orphan, sizeof(orphan), 0), Reassembler::Result::Ignored);
++  const uint8_t tooShort[] = {0x03};
++  EXPECT_EQ(r.feed(tooShort, sizeof(tooShort), 0), Reassembler::Result::Ignored);
++  const uint8_t first[] = {0x01, 0x05, 'a'};
++  const uint8_t otherId[] = {0x02, 0x06, 'b'};
++  EXPECT_EQ(r.feed(first, sizeof(first), 0), Reassembler::Result::Partial);
++  EXPECT_EQ(r.feed(otherId, sizeof(otherId), 0), Reassembler::Result::Ignored);
++  EXPECT_FALSE(r.inProgress());
++}
++
++TEST(FieldSyncFraming, SplitUtf8SequenceSurvivesReassembly) {
++  // "Zoë": the two bytes of ë land in different chunks at MTU 23 in the vectors; check a direct split too.
++  const std::string message = "{\"u\":\"Zo\xC3\xAB\"}";
++  const uint8_t a[] = {0x01, 0x01, '{', '"', 'u', '"', ':', '"', 'Z', 'o', 0xC3};
++  const uint8_t b[] = {0x02, 0x01, 0xAB, '"', '}'};
++  Reassembler r;
++  EXPECT_EQ(r.feed(a, sizeof(a), 0), Reassembler::Result::Partial);
++  EXPECT_EQ(r.feed(b, sizeof(b), 0), Reassembler::Result::Complete);
++  EXPECT_EQ(r.message(), message);
++}
+diff --git a/lib/FieldBleSync/test/MessagesTest.cpp b/lib/FieldBleSync/test/MessagesTest.cpp
+new file mode 100644
+index 0000000..81aa890
+--- /dev/null
++++ b/lib/FieldBleSync/test/MessagesTest.cpp
+@@ -0,0 +1,121 @@
++#include <ArduinoJson.h>
++#include <gtest/gtest.h>
++
++#include <string>
++
++#include "FieldSyncMessages.h"
++
++using fieldsync::Incoming;
++using fieldsync::MessageType;
++
++TEST(FieldSyncMessages, HelloMatchesTheSpecShape) {
++  EXPECT_EQ(fieldsync::buildHello("CrossPoint", "1.6.5-field-ble", "https://sync.crosspointreader.com"),
++            "{\"t\":\"hello\",\"v\":1,\"device\":\"CrossPoint\",\"fw\":\"1.6.5-field-ble\","
++            "\"baseUrl\":\"https://sync.crosspointreader.com\"}");
++}
++
++TEST(FieldSyncMessages, GetRequestHasNullBody) {
++  KOSyncRequest req;
++  req.method = "GET";
++  req.path = "/syncs/progress/0123abcd?position_kinds=locator,percentage";
++  req.headers = {{"Accept", "application/vnd.koreader.v1+json"}, {"x-auth-user", "cole"}, {"x-auth-key", "md5"}};
++  EXPECT_EQ(
++      fieldsync::buildRequest(1, req),
++      "{\"t\":\"req\",\"id\":1,\"method\":\"GET\","
++      "\"path\":\"/syncs/progress/0123abcd?position_kinds=locator,percentage\","
++      "\"headers\":{\"Accept\":\"application/vnd.koreader.v1+json\",\"x-auth-user\":\"cole\",\"x-auth-key\":\"md5\"},"
++      "\"body\":null}");
++}
++
++TEST(FieldSyncMessages, MatchesTheUtf8Vector) {
++  KOSyncRequest req;
++  req.path = "/syncs/progress/abc";
++  req.headers = {{"x-auth-user", "Zo\xC3\xAB"}};
++  EXPECT_EQ(fieldsync::buildRequest(1, req),
++            "{\"t\":\"req\",\"id\":1,\"method\":\"GET\",\"path\":\"/syncs/progress/abc\","
++            "\"headers\":{\"x-auth-user\":\"Zo\xC3\xAB\"},\"body\":null}");
++}
++
++TEST(FieldSyncMessages, EscapesHeadersAndBodyAndRoundTrips) {
++  const std::string body = "{\"document\":\"a\\\"b\",\"progress\":\"/body/DocFragment[2]\"}\n\t\x01";
++  KOSyncRequest req;
++  req.method = "PUT";
++  req.path = "/syncs/progress";
++  req.headers = {{"x-auth-user", "we\"ird\\name"}, {"X-Custom", "line1\r\nline2"}};
++  req.body = &body;
++  const std::string json = fieldsync::buildRequest(65535, req);
++
++  // No raw control characters may reach the wire.
++  for (const char c : json) EXPECT_GE(static_cast<unsigned char>(c), 0x20) << json;
++
++  JsonDocument doc;
++  ASSERT_EQ(deserializeJson(doc, json), DeserializationError::Ok);
++  EXPECT_STREQ(doc["t"], "req");
++  EXPECT_EQ(doc["id"].as<int>(), 65535);
++  EXPECT_STREQ(doc["method"], "PUT");
++  EXPECT_EQ(doc["headers"]["x-auth-user"].as<std::string>(), "we\"ird\\name");
++  EXPECT_EQ(doc["headers"]["X-Custom"].as<std::string>(), "line1\r\nline2");
++  EXPECT_EQ(doc["body"].as<std::string>(), body);
++}
++
++TEST(FieldSyncMessages, ByeAndError) {
++  EXPECT_EQ(fieldsync::buildBye("done"), "{\"t\":\"bye\",\"reason\":\"done\"}");
++  EXPECT_EQ(fieldsync::buildError("version", nullptr), "{\"t\":\"error\",\"code\":\"version\"}");
++  EXPECT_EQ(fieldsync::buildError("too_large", "x"), "{\"t\":\"error\",\"code\":\"too_large\",\"message\":\"x\"}");
++}
++
++TEST(FieldSyncMessages, ParsesResponseWithBody) {
++  const Incoming in = fieldsync::parseIncoming(
++      "{\"t\":\"res\",\"id\":7,\"status\":200,\"body\":\"{\\\"document\\\":\\\"0123abcd\\\"}\"}");
++  EXPECT_EQ(in.type, MessageType::Response);
++  EXPECT_EQ(in.id, 7u);
++  EXPECT_EQ(in.status, 200);
++  EXPECT_TRUE(in.hasBody);
++  EXPECT_EQ(in.body, "{\"document\":\"0123abcd\"}");
++  EXPECT_TRUE(in.error.empty());
++}
++
++TEST(FieldSyncMessages, ParsesNullBodyAndStatusZeroErrors) {
++  const Incoming nullBody = fieldsync::parseIncoming("{\"t\":\"res\",\"id\":2,\"status\":204,\"body\":null}");
++  EXPECT_EQ(nullBody.type, MessageType::Response);
++  EXPECT_FALSE(nullBody.hasBody);
++  EXPECT_EQ(nullBody.status, 204);
++
++  for (const char* code : {"network", "timeout", "origin_not_allowed", "bad_request", "too_large"}) {
++    const Incoming in = fieldsync::parseIncoming(std::string("{\"t\":\"res\",\"id\":3,\"status\":0,\"error\":\"") +
++                                                 code + "\",\"body\":null}");
++    EXPECT_EQ(in.type, MessageType::Response);
++    EXPECT_EQ(in.status, 0);
++    EXPECT_EQ(in.error, code);
++  }
++}
++
++TEST(FieldSyncMessages, RejectsResponsesItCannotMatch) {
++  EXPECT_EQ(fieldsync::parseIncoming("{\"t\":\"res\",\"status\":200}").type, MessageType::Invalid);
++  EXPECT_EQ(fieldsync::parseIncoming("{\"t\":\"res\",\"id\":\"1\",\"status\":200}").type, MessageType::Invalid);
++  EXPECT_EQ(fieldsync::parseIncoming("{\"t\":\"res\",\"id\":1}").type, MessageType::Invalid);
++}
++
++TEST(FieldSyncMessages, ParsesHelloByeErrorAndUnknown) {
++  const Incoming hello =
++      fieldsync::parseIncoming("{\"t\":\"hello\",\"v\":1,\"app\":\"field-sync-web\",\"appVersion\":\"0.1.0\"}");
++  EXPECT_EQ(hello.type, MessageType::Hello);
++  EXPECT_EQ(hello.version, 1);
++  EXPECT_TRUE(fieldsync::versionCompatible(hello.version));
++  EXPECT_FALSE(fieldsync::versionCompatible(fieldsync::parseIncoming("{\"t\":\"hello\",\"v\":2}").version));
++  EXPECT_FALSE(fieldsync::versionCompatible(fieldsync::parseIncoming("{\"t\":\"hello\"}").version));
++
++  const Incoming bye = fieldsync::parseIncoming("{\"t\":\"bye\",\"reason\":\"user\"}");
++  EXPECT_EQ(bye.type, MessageType::Bye);
++  EXPECT_EQ(bye.text, "user");
++
++  const Incoming err = fieldsync::parseIncoming("{\"t\":\"error\",\"code\":\"version\",\"message\":\"m\"}");
++  EXPECT_EQ(err.type, MessageType::Error);
++  EXPECT_EQ(err.code, "version");
++  EXPECT_EQ(err.text, "m");
++
++  EXPECT_EQ(fieldsync::parseIncoming("{\"t\":\"ping\"}").type, MessageType::Unknown);
++  EXPECT_EQ(fieldsync::parseIncoming("not json").type, MessageType::Invalid);
++  EXPECT_EQ(fieldsync::parseIncoming("[1,2]").type, MessageType::Invalid);
++  EXPECT_EQ(fieldsync::parseIncoming("{\"x\":1}").type, MessageType::Invalid);
++}
+diff --git a/lib/FieldBleSync/test/RelayTransportTest.cpp b/lib/FieldBleSync/test/RelayTransportTest.cpp
+new file mode 100644
+index 0000000..e034605
+--- /dev/null
++++ b/lib/FieldBleSync/test/RelayTransportTest.cpp
+@@ -0,0 +1,212 @@
++#include <ArduinoJson.h>
++#include <gtest/gtest.h>
++
++#include <deque>
++#include <string>
++#include <vector>
++
++#include "FieldSyncRelay.h"
++
++using fieldsync::RelayLink;
++using fieldsync::RelayTransport;
++
++namespace {
++
++// A scripted phone: each step answers the next request, or plays a link event.
++class FakeLink final : public RelayLink {
++ public:
++  struct Step {
++    enum Kind { Reply, Close, Silence } kind;
++    std::string message;   // Reply
++    uint32_t delayMs = 0;  // time that passes before this step
++  };
++
++  bool connected = true;
++  uint32_t clock = 0;
++  std::vector<std::string> sent;
++  std::deque<Step> script;
++  int receives = 0;
++
++  bool send(const std::string& message) override {
++    if (!connected) return false;
++    sent.push_back(message);
++    return true;
++  }
++
++  Wait receive(std::string& out, const uint32_t timeoutMs) override {
++    ++receives;
++    if (script.empty() || script.front().kind == Step::Silence) {
++      clock += timeoutMs;
++      if (!script.empty()) script.pop_front();
++      return Wait::Timeout;
++    }
++    Step step = script.front();
++    script.pop_front();
++    if (step.delayMs > timeoutMs) {
++      clock += timeoutMs;
++      script.push_front(Step{step.kind, step.message, step.delayMs - timeoutMs});
++      return Wait::Timeout;
++    }
++    clock += step.delayMs;
++    if (step.kind == Step::Close) {
++      connected = false;
++      return Wait::Closed;
++    }
++    out = step.message;
++    return Wait::Message;
++  }
++
++  uint32_t nowMs() override { return clock; }
++
++  void reply(const std::string& message, const uint32_t delayMs = 0) {
++    script.push_back(Step{Step::Reply, message, delayMs});
++  }
++};
++
++KOSyncRequest getRequest() {
++  KOSyncRequest req;
++  req.path = "/users/auth";
++  req.headers = {{"x-auth-user", "cole"}};
++  return req;
++}
++
++int sentId(const std::string& json) {
++  JsonDocument doc;
++  EXPECT_EQ(deserializeJson(doc, json), DeserializationError::Ok);
++  return doc["id"].as<int>();
++}
++
++}  // namespace
++
++TEST(FieldSyncRelay, SendsRequestAndReturnsMatchingResponse) {
++  FakeLink link;
++  link.reply("{\"t\":\"res\",\"id\":1,\"status\":200,\"body\":\"{\\\"ok\\\":true}\"}", 120);
++  RelayTransport transport(link);
++  std::string body;
++  EXPECT_EQ(transport.perform(getRequest(), &body), 200);
++  EXPECT_EQ(body, "{\"ok\":true}");
++  ASSERT_EQ(link.sent.size(), 1u);
++  EXPECT_EQ(
++      link.sent[0],
++      "{\"t\":\"req\",\"id\":1,\"method\":\"GET\",\"path\":\"/users/auth\",\"headers\":{\"x-auth-user\":\"cole\"},"
++      "\"body\":null}");
++  EXPECT_FALSE(transport.needsTlsHeap());
++}
++
++TEST(FieldSyncRelay, IdsIncreaseAndWrapPast65535) {
++  FakeLink link;
++  RelayTransport transport(link);
++  for (int i = 1; i <= 65536; ++i) {
++    const int expected = i == 65536 ? 1 : i;
++    link.reply("{\"t\":\"res\",\"id\":" + std::to_string(expected) + ",\"status\":200,\"body\":null}");
++    ASSERT_EQ(transport.perform(getRequest(), nullptr), 200) << i;
++    ASSERT_EQ(sentId(link.sent.back()), expected);
++    link.sent.clear();
++  }
++}
++
++TEST(FieldSyncRelay, SkipsStaleResponsesAndOtherMessages) {
++  FakeLink link;
++  RelayTransport transport(link);
++  link.reply("{\"t\":\"res\",\"id\":1,\"status\":200,\"body\":null}");
++  ASSERT_EQ(transport.perform(getRequest(), nullptr), 200);
++
++  // Request 2: a late duplicate for id 1, junk, a repeated hello, then the answer.
++  link.reply("{\"t\":\"res\",\"id\":1,\"status\":500,\"body\":null}");
++  link.reply("garbage");
++  link.reply("{\"t\":\"hello\",\"v\":1}");
++  link.reply("{\"t\":\"res\",\"id\":2,\"status\":404,\"body\":null}");
++  std::string body = "stale";
++  EXPECT_EQ(transport.perform(getRequest(), &body), 404);
++  EXPECT_TRUE(body.empty());
++}
++
++TEST(FieldSyncRelay, StatusZeroMapsToNetworkErrorWithCode) {
++  FakeLink link;
++  RelayTransport transport(link);
++  link.reply("{\"t\":\"res\",\"id\":1,\"status\":0,\"error\":\"origin_not_allowed\",\"body\":null}");
++  EXPECT_EQ(transport.perform(getRequest(), nullptr), 0);
++  EXPECT_EQ(transport.lastError(), "origin_not_allowed");
++  EXPECT_FALSE(transport.closed());
++
++  link.reply("{\"t\":\"res\",\"id\":2,\"status\":0}");
++  EXPECT_EQ(transport.perform(getRequest(), nullptr), 0);
++  EXPECT_EQ(transport.lastError(), "network");
++}
++
++TEST(FieldSyncRelay, TimesOutAfterThirtySeconds) {
++  FakeLink link;
++  RelayTransport transport(link);
++  link.reply("{\"t\":\"res\",\"id\":1,\"status\":200,\"body\":null}", 30001);
++  EXPECT_EQ(transport.perform(getRequest(), nullptr), -1);
++  EXPECT_EQ(transport.lastError(), "timeout");
++  EXPECT_GE(link.clock, fieldsync::RESPONSE_TIMEOUT_MS);
++  EXPECT_LT(link.clock, fieldsync::RESPONSE_TIMEOUT_MS + 10);
++  EXPECT_FALSE(transport.closed());
++
++  // The late answer to id 1 is then ignored by request 2.
++  link.reply("{\"t\":\"res\",\"id\":2,\"status\":200,\"body\":null}");
++  EXPECT_EQ(transport.perform(getRequest(), nullptr), 200);
++}
++
++TEST(FieldSyncRelay, ResponseJustInsideTheWindowIsAccepted) {
++  FakeLink link;
++  RelayTransport transport(link);
++  link.reply("{\"t\":\"hello\",\"v\":1}", 10000);
++  link.reply("{\"t\":\"res\",\"id\":1,\"status\":201,\"body\":null}", 19999);
++  EXPECT_EQ(transport.perform(getRequest(), nullptr), 201);
++}
++
++TEST(FieldSyncRelay, ClosedLinkFailsThisAndLaterRequests) {
++  FakeLink link;
++  RelayTransport transport(link);
++  link.script.push_back({FakeLink::Step::Close, "", 50});
++  EXPECT_EQ(transport.perform(getRequest(), nullptr), -1);
++  EXPECT_TRUE(transport.closed());
++  const size_t sentBefore = link.sent.size();
++  EXPECT_EQ(transport.perform(getRequest(), nullptr), -1);
++  EXPECT_EQ(link.sent.size(), sentBefore);  // nothing is sent on a closed link
++}
++
++TEST(FieldSyncRelay, ByeOrErrorFromPhoneEndsTheRelay) {
++  {
++    FakeLink link;
++    RelayTransport transport(link);
++    link.reply("{\"t\":\"bye\",\"reason\":\"user\"}");
++    EXPECT_EQ(transport.perform(getRequest(), nullptr), -1);
++    EXPECT_TRUE(transport.closed());
++    EXPECT_EQ(transport.lastError(), "bye");
++  }
++  {
++    FakeLink link;
++    RelayTransport transport(link);
++    link.reply("{\"t\":\"error\",\"code\":\"version\"}");
++    EXPECT_EQ(transport.perform(getRequest(), nullptr), -1);
++    EXPECT_TRUE(transport.closed());
++    EXPECT_EQ(transport.lastError(), "version");
++  }
++}
++
++TEST(FieldSyncRelay, SendFailureIsANetworkError) {
++  FakeLink link;
++  link.connected = false;
++  RelayTransport transport(link);
++  EXPECT_EQ(transport.perform(getRequest(), nullptr), -1);
++  EXPECT_EQ(transport.lastError(), "send");
++}
++
++TEST(FieldSyncRelay, PutBodyIsRelayedVerbatim) {
++  FakeLink link;
++  RelayTransport transport(link);
++  const std::string body = "{\"document\":\"x\",\"percentage\":0.5}";
++  KOSyncRequest req;
++  req.method = "PUT";
++  req.path = "/syncs/progress";
++  req.body = &body;
++  link.reply("{\"t\":\"res\",\"id\":1,\"status\":200,\"body\":\"{}\"}");
++  EXPECT_EQ(transport.perform(req, nullptr), 200);
++  JsonDocument doc;
++  ASSERT_EQ(deserializeJson(doc, link.sent[0]), DeserializationError::Ok);
++  EXPECT_STREQ(doc["method"], "PUT");
++  EXPECT_EQ(doc["body"].as<std::string>(), body);
++}
+diff --git a/lib/FieldBleSync/test/vectors.json b/lib/FieldBleSync/test/vectors.json
+new file mode 100644
+index 0000000..4704bc5
+--- /dev/null
++++ b/lib/FieldBleSync/test/vectors.json
+@@ -0,0 +1,50 @@
++{
++  "protocol": 1,
++  "maxMessageBytes": 16384,
++  "framing": [
++    {
++      "name": "hello-single-mtu247",
++      "message": "{\"t\":\"hello\",\"v\":1,\"app\":\"field-sync-web\",\"appVersion\":\"0.1.0\"}",
++      "msgId": 7,
++      "mtu": 247,
++      "chunks": [
++        "03077b2274223a2268656c6c6f222c2276223a312c22617070223a226669656c642d73796e632d776562222c2261707056657273696f6e223a22302e312e30227d"
++      ]
++    },
++    {
++      "name": "hello-mtu23",
++      "message": "{\"t\":\"hello\",\"v\":1,\"app\":\"field-sync-web\",\"appVersion\":\"0.1.0\"}",
++      "msgId": 7,
++      "mtu": 23,
++      "chunks": [
++        "01077b2274223a2268656c6c6f222c2276223a31",
++        "00072c22617070223a226669656c642d73796e63",
++        "00072d776562222c2261707056657273696f6e22",
++        "02073a22302e312e30227d"
++      ]
++    },
++    {
++      "name": "req-utf8-mtu23",
++      "message": "{\"t\":\"req\",\"id\":1,\"method\":\"GET\",\"path\":\"/syncs/progress/abc\",\"headers\":{\"x-auth-user\":\"Zoë\"},\"body\":null}",
++      "msgId": 255,
++      "mtu": 23,
++      "chunks": [
++        "01ff7b2274223a22726571222c226964223a312c",
++        "00ff226d6574686f64223a22474554222c227061",
++        "00ff7468223a222f73796e63732f70726f677265",
++        "00ff73732f616263222c2268656164657273223a",
++        "00ff7b22782d617574682d75736572223a225a6f",
++        "02ffc3ab227d2c22626f6479223a6e756c6c7d"
++      ]
++    },
++    {
++      "name": "bye-exact-18",
++      "message": "{\"t\":\"bye\",\"r\":1}",
++      "msgId": 0,
++      "mtu": 23,
++      "chunks": [
++        "03007b2274223a22627965222c2272223a317d"
++      ]
++    }
++  ]
++}
+\ No newline at end of file
+diff --git a/test/CMakeLists.txt b/test/CMakeLists.txt
+index 7e2d5e7..abfc68e 100644
+--- a/test/CMakeLists.txt
++++ b/test/CMakeLists.txt
+@@ -104,6 +104,7 @@ add_subdirectory(ble_chapter_build_gate)
+ add_subdirectory(ble_remote_turn_gate)
+ 
+ add_subdirectory(${REPO_ROOT}/lib/BlePageTurner/test BlePageTurnerTests)
++add_subdirectory(${REPO_ROOT}/lib/FieldBleSync/test FieldBleSyncTests)
+ 
+ add_test(NAME selection_buttons COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_selection_buttons.py)
+ add_test(NAME list_viewport COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_list_viewport.py)
+-- 
+2.56.0
+
