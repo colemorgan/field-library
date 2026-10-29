@@ -1,0 +1,60 @@
+From cdc84e983d7892ef75a31c31480837ba38d4047c Mon Sep 17 00:00:00 2001
+From: Cole Morgan <cole@letsgolive.io>
+Date: Wed, 28 Oct 2026 23:13:48 -0400
+Subject: [PATCH 6/6] Field Sync: limit the wait between connection and hello
+ to 2 minutes
+
+A phone that connects but never pairs or sends hello kept the reader
+awake in PHONE_WAITING with no deadline.
+---
+ lib/FieldBleSync/include/FieldBlePeripheral.h | 3 +++
+ lib/FieldBleSync/src/FieldBlePeripheral.cpp   | 5 +++++
+ 2 files changed, 8 insertions(+)
+
+diff --git a/lib/FieldBleSync/include/FieldBlePeripheral.h b/lib/FieldBleSync/include/FieldBlePeripheral.h
+index 4dd2005..ad48ba2 100644
+--- a/lib/FieldBleSync/include/FieldBlePeripheral.h
++++ b/lib/FieldBleSync/include/FieldBlePeripheral.h
+@@ -24,6 +24,8 @@ namespace fieldsync {
+ class BlePeripheral final : public RelayLink {
+  public:
+   static constexpr uint32_t ADVERTISE_TIMEOUT_MS = 60000;
++  // Time from connection to hello, which covers typing the passkey.
++  static constexpr uint32_t CONNECT_TIMEOUT_MS = 120000;
+   static constexpr uint16_t PREFERRED_MTU = 247;
+ 
+   enum class Phase : uint8_t {
+@@ -78,6 +80,7 @@ class BlePeripheral final : public RelayLink {
+   Phase currentPhase = Phase::Off;
+   Failure currentFailure = Failure::None;
+   uint32_t advertiseStartMs = 0;
++  uint32_t connectedAtMs = 0;
+   uint8_t nextMsgId = 0;
+   bool running = false;
+ 
+diff --git a/lib/FieldBleSync/src/FieldBlePeripheral.cpp b/lib/FieldBleSync/src/FieldBlePeripheral.cpp
+index 7800c3b..28578be 100644
+--- a/lib/FieldBleSync/src/FieldBlePeripheral.cpp
++++ b/lib/FieldBleSync/src/FieldBlePeripheral.cpp
+@@ -230,6 +230,7 @@ BlePeripheral::Phase BlePeripheral::poll() {
+     case Phase::Advertising:
+       if (linked) {
+         currentPhase = Phase::Connected;
++        connectedAtMs = millis();
+       } else if (millis() - advertiseStartMs >= ADVERTISE_TIMEOUT_MS) {
+         NimBLEDevice::getAdvertising()->stop();
+         currentPhase = Phase::TimedOut;
+@@ -242,6 +243,10 @@ BlePeripheral::Phase BlePeripheral::poll() {
+         restartAdvertising();
+         break;
+       }
++      if (millis() - connectedAtMs >= CONNECT_TIMEOUT_MS) {
++        fail(Failure::PhoneLeft);
++        break;
++      }
+       handshake();
+       break;
+     case Phase::Ready:
+-- 
+2.56.0
+

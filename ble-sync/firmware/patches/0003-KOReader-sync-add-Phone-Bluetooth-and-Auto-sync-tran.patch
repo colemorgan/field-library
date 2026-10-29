@@ -1,7 +1,7 @@
 From 6d9855e0d799ecec45d4797cc02908214d8912f4 Mon Sep 17 00:00:00 2001
 From: Cole Morgan <colerussellmorgan@gmail.com>
 Date: Wed, 28 Oct 2026 22:42:46 -0400
-Subject: [PATCH 3/5] KOReader sync: add Phone (Bluetooth) and Auto sync
+Subject: [PATCH 3/6] KOReader sync: add Phone (Bluetooth) and Auto sync
  transports on X4 Classic
 
 A Sync Transport setting (Wi-Fi, Phone (Bluetooth), Auto) is stored with

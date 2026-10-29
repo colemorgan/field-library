@@ -1,7 +1,7 @@
 From 5871dbca93d3a6e50d445357f0e423845b08f794 Mon Sep 17 00:00:00 2001
 From: Cole Morgan <colerussellmorgan@gmail.com>
 Date: Wed, 28 Oct 2026 22:42:46 -0400
-Subject: [PATCH 1/5] KOReaderSync: route sync requests through a transport
+Subject: [PATCH 1/6] KOReaderSync: route sync requests through a transport
  seam
 
 KOReaderSyncClient keeps building requests and parsing responses, but

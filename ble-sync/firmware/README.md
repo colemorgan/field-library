@@ -17,6 +17,8 @@ Pinned upstream commit: [`UPSTREAM_COMMIT`](UPSTREAM_COMMIT) (`develop`).
 | 0002 | New `lib/FieldBleSync`: chunk framing, protocol messages, `RelayTransport` (one request at a time, 30 s timeout), and a NimBLE GATT peripheral (built only with `-DFIELD_BLE_SYNC=1`). Includes host tests. |
 | 0003 | **Settings → CrossPoint Sync → Sync Transport**: Wi-Fi (default), Phone (Bluetooth), Auto. The sync screen runs the Bluetooth flow. `env:x4c` sets `FIELD_BLE_SYNC=1` and keeps NimBLE's peripheral and broadcaster roles. |
 | 0004 | Shows "Allow this server in Field Sync on your phone" when the phone refuses the server origin. |
+| 0005 | The relay transport omits `Authorization: Basic`; only `x-auth-user` and `x-auth-key` go over Bluetooth. |
+| 0006 | Ends the sync if a connected phone has not paired and sent its hello within 2 minutes. |
 
 Bluetooth details:
 
@@ -99,8 +101,11 @@ been measured. The relay itself buffers at most one message: 16 KB maximum, in P
   remotes. When the store is full, NimBLE removes the oldest bond.
 - Clipping sync is skipped over Bluetooth because it uses its own HTTP client. Account sign-up and
   authentication in Settings still use Wi-Fi only.
-- The relay sends the same headers as Wi-Fi, including `Authorization: Basic`, which contains the
-  password. The phone receives the password through the encrypted link.
+- The relay does not send `Authorization: Basic` (patch 0005). The default server's CORS rules
+  reject it, and it would expose the plain password to the phone. Servers that need Basic auth
+  (Calibre-Web-Automated) do not work over Bluetooth.
+- After a phone connects, it has 2 minutes to pair and send its hello (patch 0006). After that the
+  reader ends the sync and turns Bluetooth off.
 - Header names are JSON object keys, so a duplicate header name keeps only the last value.
 - Only `env:x4c` enables the feature. The `x4c-gh_release*` environments do not.
 - The firmware's agent guide requires a four-reviewer handoff (`.agents/skills/firmware-handoff`)

@@ -1,7 +1,7 @@
 From 72526cf5c6720faac5052dd86b50798b5d72b127 Mon Sep 17 00:00:00 2001
 From: Cole Morgan <cole@letsgolive.io>
 Date: Wed, 28 Oct 2026 22:59:43 -0400
-Subject: [PATCH 5/5] Field Sync: do not send Basic auth over the Bluetooth
+Subject: [PATCH 5/6] Field Sync: do not send Basic auth over the Bluetooth
  relay
 
 The default sync server's CORS allow-list omits Authorization, so the

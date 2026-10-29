@@ -442,3 +442,24 @@ test('session: hello timeout starts only after the hello write completes (passke
   await new Promise((r) => setTimeout(r, 80));
   assert.deepEqual(result, { reason: 'no hello from reader' });
 });
+
+test('session: a failed first hello write (pairing in progress) is retried', async () => {
+  const { phone, reader } = createLinkPair();
+  const write = phone.write;
+  let failures = 1;
+  phone.write = async (chunk) => {
+    if (failures > 0) {
+      failures--;
+      throw new Error('GATT operation failed: insufficient authentication');
+    }
+    return write(chunk);
+  };
+  const fast = (fn, ms) => globalThis.setTimeout(fn, Math.min(ms, 5));
+  const session = new RelaySession({ link: phone, fetch: async () => {}, setTimeout: fast });
+  const done = session.run();
+  const fake = new FakeReader(reader, { mtu: 23, baseUrl: BASE });
+  const hello = await fake.handshake();
+  assert.equal(hello.t, 'hello');
+  await session.cancel();
+  assert.deepEqual(await done, { reason: 'cancelled' });
+});
