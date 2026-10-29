@@ -1,0 +1,114 @@
+From 76d31ef5b2e1ff2d6cba8ab4d16da4e0f0d517c1 Mon Sep 17 00:00:00 2001
+From: Cole Morgan <colerussellmorgan@gmail.com>
+Date: Wed, 28 Oct 2026 22:46:20 -0400
+Subject: [PATCH 4/6] Field Sync: show the allowlist hint when the phone
+ refuses the server
+
+The phone answers requests to an origin missing from its allowlist with
+status 0 and error "origin_not_allowed" and stays connected. The sync
+screen now says to allow the server in the phone app. Tests cover the
+refusal, empty ("") response bodies, a bye without a reason and chunks
+smaller than the MTU.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ lib/FieldBleSync/test/FramingTest.cpp          | 11 +++++++++++
+ lib/FieldBleSync/test/MessagesTest.cpp         | 10 ++++++++++
+ lib/FieldBleSync/test/RelayTransportTest.cpp   | 13 +++++++++++++
+ lib/I18n/translations/english.yaml             |  1 +
+ src/activities/reader/KOReaderSyncActivity.cpp |  6 ++++--
+ 5 files changed, 39 insertions(+), 2 deletions(-)
+
+diff --git a/lib/FieldBleSync/test/FramingTest.cpp b/lib/FieldBleSync/test/FramingTest.cpp
+index ecf11e5..8a42f2c 100644
+--- a/lib/FieldBleSync/test/FramingTest.cpp
++++ b/lib/FieldBleSync/test/FramingTest.cpp
+@@ -223,3 +223,14 @@ TEST(FieldSyncFraming, SplitUtf8SequenceSurvivesReassembly) {
+   EXPECT_EQ(r.feed(b, sizeof(b), 0), Reassembler::Result::Complete);
+   EXPECT_EQ(r.message(), message);
+ }
++
++TEST(FieldSyncFraming, AcceptsChunksSmallerThanTheMtu) {
++  // The phone writes 20-byte chunks whatever MTU was negotiated.
++  const std::string message = "{\"t\":\"res\",\"id\":1,\"status\":200,\"body\":\"\"}";
++  const auto chunks = encode(message, 8, 23);
++  Reassembler r;
++  Reassembler::Result last = Reassembler::Result::Ignored;
++  for (const auto& c : chunks) last = r.feed(c.data(), c.size(), 0);
++  ASSERT_EQ(last, Reassembler::Result::Complete);
++  EXPECT_EQ(r.message(), message);
++}
+diff --git a/lib/FieldBleSync/test/MessagesTest.cpp b/lib/FieldBleSync/test/MessagesTest.cpp
+index 81aa890..98b233e 100644
+--- a/lib/FieldBleSync/test/MessagesTest.cpp
++++ b/lib/FieldBleSync/test/MessagesTest.cpp
+@@ -119,3 +119,13 @@ TEST(FieldSyncMessages, ParsesHelloByeErrorAndUnknown) {
+   EXPECT_EQ(fieldsync::parseIncoming("[1,2]").type, MessageType::Invalid);
+   EXPECT_EQ(fieldsync::parseIncoming("{\"x\":1}").type, MessageType::Invalid);
+ }
++
++TEST(FieldSyncMessages, EmptyBodyAndOptionalByeReason) {
++  const Incoming empty = fieldsync::parseIncoming("{\"t\":\"res\",\"id\":4,\"status\":200,\"body\":\"\"}");
++  EXPECT_EQ(empty.type, MessageType::Response);
++  EXPECT_TRUE(empty.hasBody);
++  EXPECT_TRUE(empty.body.empty());
++  const Incoming bye = fieldsync::parseIncoming("{\"t\":\"bye\"}");
++  EXPECT_EQ(bye.type, MessageType::Bye);
++  EXPECT_TRUE(bye.text.empty());
++}
+diff --git a/lib/FieldBleSync/test/RelayTransportTest.cpp b/lib/FieldBleSync/test/RelayTransportTest.cpp
+index e034605..984013d 100644
+--- a/lib/FieldBleSync/test/RelayTransportTest.cpp
++++ b/lib/FieldBleSync/test/RelayTransportTest.cpp
+@@ -210,3 +210,16 @@ TEST(FieldSyncRelay, PutBodyIsRelayedVerbatim) {
+   EXPECT_STREQ(doc["method"], "PUT");
+   EXPECT_EQ(doc["body"].as<std::string>(), body);
+ }
++
++TEST(FieldSyncRelay, OriginRefusalKeepsTheLinkAndReportsTheCode) {
++  FakeLink link;
++  RelayTransport transport(link);
++  link.reply("{\"t\":\"res\",\"id\":1,\"status\":0,\"error\":\"origin_not_allowed\"}");
++  EXPECT_EQ(transport.perform(getRequest(), nullptr), 0);
++  EXPECT_EQ(transport.lastError(), "origin_not_allowed");
++  EXPECT_FALSE(transport.closed());
++  link.reply("{\"t\":\"res\",\"id\":2,\"status\":200,\"body\":\"\"}");
++  std::string body = "x";
++  EXPECT_EQ(transport.perform(getRequest(), &body), 200);
++  EXPECT_TRUE(body.empty());
++}
+diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
+index 00d632d..1e5572d 100644
+--- a/lib/I18n/translations/english.yaml
++++ b/lib/I18n/translations/english.yaml
+@@ -205,6 +205,7 @@ STR_FIELD_SYNC_PASSKEY: "Enter this code on your phone"
+ STR_FIELD_SYNC_NO_PHONE: "No phone connected"
+ STR_FIELD_SYNC_VERSION: "Update the Field Sync app"
+ STR_FIELD_SYNC_PHONE_LEFT: "Phone disconnected"
++STR_FIELD_SYNC_ALLOW_SERVER: "Allow this server in Field Sync on your phone"
+ STR_AUTHENTICATE: "Authenticate"
+ STR_SIGN_UP: "Sign Up"
+ STR_CREATING_ACCOUNT: "Creating account..."
+diff --git a/src/activities/reader/KOReaderSyncActivity.cpp b/src/activities/reader/KOReaderSyncActivity.cpp
+index 8f7109a..ff04a66 100644
+--- a/src/activities/reader/KOReaderSyncActivity.cpp
++++ b/src/activities/reader/KOReaderSyncActivity.cpp
+@@ -799,11 +799,13 @@ void KOReaderSyncActivity::loop() {
+   // The exchange is over: say bye and give the radio back before the result shows.
+   if (phone && (state == SYNC_FAILED || state == UPLOAD_COMPLETE || state == SYNC_COMPLETE)) {
+     const bool phoneLeft = relay && relay->closed();
++    // The phone refuses servers missing from its allowlist with status 0.
++    const bool originRefused = relay && relay->lastError() == "origin_not_allowed";
+     finishPhone(state == SYNC_FAILED ? "error" : "done");
+-    if (state == SYNC_FAILED && phoneLeft) {
++    if (state == SYNC_FAILED && (phoneLeft || originRefused)) {
+       {
+         RenderLock lock(*this);
+-        statusMessage = tr(STR_FIELD_SYNC_PHONE_LEFT);
++        statusMessage = originRefused ? tr(STR_FIELD_SYNC_ALLOW_SERVER) : tr(STR_FIELD_SYNC_PHONE_LEFT);
+       }
+       requestUpdate();
+     }
+-- 
+2.56.0
+

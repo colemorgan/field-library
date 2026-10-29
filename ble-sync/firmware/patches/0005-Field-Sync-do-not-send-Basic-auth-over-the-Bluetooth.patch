@@ -1,0 +1,101 @@
+From 72526cf5c6720faac5052dd86b50798b5d72b127 Mon Sep 17 00:00:00 2001
+From: Cole Morgan <cole@letsgolive.io>
+Date: Wed, 28 Oct 2026 22:59:43 -0400
+Subject: [PATCH 5/6] Field Sync: do not send Basic auth over the Bluetooth
+ relay
+
+The default sync server's CORS allow-list omits Authorization, so the
+phone's browser would block every relayed request. x-auth-* is enough
+for KOSync servers, and the phone no longer sees the plain password.
+---
+ lib/FieldBleSync/include/FieldSyncRelay.h    |  1 +
+ lib/FieldBleSync/test/RelayTransportTest.cpp |  1 +
+ lib/KOReaderSync/KOReaderSyncClient.cpp      | 11 ++++++-----
+ lib/KOReaderSync/KOReaderSyncTransport.h     |  3 +++
+ 4 files changed, 11 insertions(+), 5 deletions(-)
+
+diff --git a/lib/FieldBleSync/include/FieldSyncRelay.h b/lib/FieldBleSync/include/FieldSyncRelay.h
+index 9069ca3..1484c00 100644
+--- a/lib/FieldBleSync/include/FieldSyncRelay.h
++++ b/lib/FieldBleSync/include/FieldSyncRelay.h
+@@ -35,6 +35,7 @@ class RelayTransport final : public KOSyncTransport {
+   // HTTP status; 0 when the phone answered status 0 (it could not reach the
+   // server); -1 on timeout or a closed link. Both map to NETWORK_ERROR.
+   int perform(const KOSyncRequest& request, std::string* responseBody) override;
++  bool sendsBasicAuth() const override { return false; }
+ 
+   // The link is gone (phone left, sent bye/error, or oversize data): later
+   // requests fail at once.
+diff --git a/lib/FieldBleSync/test/RelayTransportTest.cpp b/lib/FieldBleSync/test/RelayTransportTest.cpp
+index 984013d..0eef1a0 100644
+--- a/lib/FieldBleSync/test/RelayTransportTest.cpp
++++ b/lib/FieldBleSync/test/RelayTransportTest.cpp
+@@ -91,6 +91,7 @@ TEST(FieldSyncRelay, SendsRequestAndReturnsMatchingResponse) {
+       "{\"t\":\"req\",\"id\":1,\"method\":\"GET\",\"path\":\"/users/auth\",\"headers\":{\"x-auth-user\":\"cole\"},"
+       "\"body\":null}");
+   EXPECT_FALSE(transport.needsTlsHeap());
++  EXPECT_FALSE(transport.sendsBasicAuth());
+ }
+ 
+ TEST(FieldSyncRelay, IdsIncreaseAndWrapPast65535) {
+diff --git a/lib/KOReaderSync/KOReaderSyncClient.cpp b/lib/KOReaderSync/KOReaderSyncClient.cpp
+index cc0bec8..0a6372a 100644
+--- a/lib/KOReaderSync/KOReaderSyncClient.cpp
++++ b/lib/KOReaderSync/KOReaderSyncClient.cpp
+@@ -26,11 +26,12 @@ constexpr uint32_t MIN_FREE_FOR_TLS = 35000;
+ constexpr uint32_t MIN_BLOCK_FOR_TLS = 20000;
+ 
+ // The shared KOSync auth headers. x-auth-* is the native KOSync scheme; Basic
+-// auth is added for Calibre-Web-Automated compatibility.
+-void applyAuthHeaders(KOSyncRequest& request) {
++// auth is added for Calibre-Web-Automated compatibility when the transport allows it.
++void applyAuthHeaders(KOSyncRequest& request, const bool basicAuth) {
+   request.headers.emplace_back("Accept", "application/vnd.koreader.v1+json");
+   request.headers.emplace_back("x-auth-user", KOREADER_STORE.getUsername());
+   request.headers.emplace_back("x-auth-key", KOREADER_STORE.getMd5Password());
++  if (!basicAuth) return;
+   const std::string credentials = KOREADER_STORE.getUsername() + ":" + KOREADER_STORE.getPassword();
+   const String encoded = base64::encode(credentials.c_str());
+   request.headers.emplace_back("Authorization", std::string("Basic ") + encoded.c_str());
+@@ -100,7 +101,7 @@ KOReaderSyncClient::Error KOReaderSyncClient::authenticate() {
+   if (lowMemoryForTransport()) return LOW_MEMORY;
+ 
+   applyCustomHeaders(request);
+-  applyAuthHeaders(request);
++  applyAuthHeaders(request, activeTransport->sendsBasicAuth());
+   const int httpCode = activeTransport->perform(request, nullptr);
+   lastHttpCode = httpCode;
+ 
+@@ -163,7 +164,7 @@ KOReaderSyncClient::Error KOReaderSyncClient::getProgress(const std::string& doc
+   if (lowMemoryForTransport()) return LOW_MEMORY;
+ 
+   applyCustomHeaders(request);
+-  applyAuthHeaders(request);
++  applyAuthHeaders(request, activeTransport->sendsBasicAuth());
+   std::string responseBody;
+   const int httpCode = activeTransport->perform(request, &responseBody);
+   lastHttpCode = httpCode;
+@@ -286,7 +287,7 @@ KOReaderSyncClient::Error KOReaderSyncClient::updateProgress(const KOReaderProgr
+   LOG_DBG("KOSync", "Request body: %s", body.c_str());
+ 
+   applyCustomHeaders(request);
+-  applyAuthHeaders(request);
++  applyAuthHeaders(request, activeTransport->sendsBasicAuth());
+   request.headers.emplace_back("Content-Type", "application/json");
+   request.body = &body;
+   const int httpCode = activeTransport->perform(request, nullptr);
+diff --git a/lib/KOReaderSync/KOReaderSyncTransport.h b/lib/KOReaderSync/KOReaderSyncTransport.h
+index a59fa6d..a35c894 100644
+--- a/lib/KOReaderSync/KOReaderSyncTransport.h
++++ b/lib/KOReaderSync/KOReaderSyncTransport.h
+@@ -21,4 +21,7 @@ class KOSyncTransport {
+   virtual int perform(const KOSyncRequest& request, std::string* responseBody) = 0;
+   // True when a request opens a TLS session on this device (heap preflight).
+   virtual bool needsTlsHeap() const { return false; }
++  // False when Basic auth must not be sent: it is outside the CORS allow-list
++  // of the default server and would expose the plain password to a relay.
++  virtual bool sendsBasicAuth() const { return true; }
+ };
+-- 
+2.56.0
+

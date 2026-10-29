@@ -63,4 +63,6 @@ No private medical notes, home coordinates or personal evacuation plans belong i
 - Add a regional map pack after the owner selects a region. Maps are not included yet.
 - Expand to selected encyclopedia articles with per-source attribution and license handling.
 
+Optional: `ble-sync/` is a CrossPoint fork plus a phone relay that syncs reading progress over Bluetooth through your phone. It has not been tested on hardware. The book itself still runs on stock firmware.
+
 Keep version one as a book that runs on existing firmware. Only fork CrossPoint if device testing exposes a concrete navigation need.

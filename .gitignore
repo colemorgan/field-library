@@ -2,3 +2,6 @@ cache/
 __pycache__/
 *.pyc
 personal/
+ble-sync/firmware/crosspoint/
+ble-sync/firmware/.venv/
+ble-sync/phone/node_modules/

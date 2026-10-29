@@ -16,3 +16,14 @@ Not yet performed. Record the exact reader model, firmware version and EPUB SHA-
 - [ ] Verify it is readable under the lighting where it will be used; there is no built-in light.
 
 Maps, first aid, shelter and repairs have not been supplied in the starter edition. Do not mark those capabilities tested.
+
+## Bluetooth phone sync (Field Sync fork only; see `ble-sync/`)
+
+- [ ] Forked firmware flashes and boots; stock firmware backup saved first.
+- [ ] Settings → Connectivity → CrossPoint Sync shows Sync Transport; set Phone (Bluetooth).
+- [ ] Sync Progress shows the waiting screen; phone finds `FieldSync-XXXX`.
+- [ ] First pairing shows a passkey on the reader; the phone accepts it.
+- [ ] Progress uploads from the reader and downloads to it, matching the phone reading app.
+- [ ] Reader stops advertising after the sync and after 60 s with no phone.
+- [ ] A paired Bluetooth page turner reconnects afterward.
+- [ ] Auto transport uses saved Wi-Fi when available and falls back to the phone otherwise.

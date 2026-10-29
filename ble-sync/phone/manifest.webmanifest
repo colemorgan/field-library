@@ -1,0 +1,13 @@
+{
+  "name": "Field Sync",
+  "short_name": "Field Sync",
+  "description": "Relay e-reader reading-progress sync over Bluetooth.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#f6f4ef",
+  "theme_color": "#1f5fbf",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "name": "field-sync-phone",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Static Web Bluetooth app that relays e-reader KOReader-sync requests to the sync server.",
+  "type": "module",
+  "scripts": {
+    "test": "node --test",
+    "serve": "node serve.js",
+    "check:browser": "node scripts/browser-check.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

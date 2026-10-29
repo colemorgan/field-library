@@ -1,0 +1,330 @@
+From 5871dbca93d3a6e50d445357f0e423845b08f794 Mon Sep 17 00:00:00 2001
+From: Cole Morgan <colerussellmorgan@gmail.com>
+Date: Wed, 28 Oct 2026 22:42:46 -0400
+Subject: [PATCH 1/6] KOReaderSync: route sync requests through a transport
+ seam
+
+KOReaderSyncClient keeps building requests and parsing responses, but
+hands each request to a KOSyncTransport. The default transport is the
+existing Wi-Fi HTTPS client with unchanged headers and status handling;
+setTransport() lets a caller substitute another link. The TLS heap
+preflight only runs for transports that open TLS on the device.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ lib/KOReaderSync/KOReaderSyncClient.cpp  | 153 ++++++++++++-----------
+ lib/KOReaderSync/KOReaderSyncClient.h    |   8 ++
+ lib/KOReaderSync/KOReaderSyncTransport.h |  24 ++++
+ 3 files changed, 110 insertions(+), 75 deletions(-)
+ create mode 100644 lib/KOReaderSync/KOReaderSyncTransport.h
+
+diff --git a/lib/KOReaderSync/KOReaderSyncClient.cpp b/lib/KOReaderSync/KOReaderSyncClient.cpp
+index e3235e7..cc0bec8 100644
+--- a/lib/KOReaderSync/KOReaderSyncClient.cpp
++++ b/lib/KOReaderSync/KOReaderSyncClient.cpp
+@@ -9,6 +9,7 @@
+ #include <string>
+ 
+ #include "KOReaderCredentialStore.h"
++#include "KOReaderSyncTransport.h"
+ 
+ int KOReaderSyncClient::lastHttpCode = 0;
+ 
+@@ -24,26 +25,49 @@ constexpr char DEVICE_ID[] = "crosspoint-reader";
+ constexpr uint32_t MIN_FREE_FOR_TLS = 35000;
+ constexpr uint32_t MIN_BLOCK_FOR_TLS = 20000;
+ 
+-// Apply the shared KOSync auth headers after begin(). x-auth-* is the native
+-// KOSync scheme; Basic auth is added for Calibre-Web-Automated compatibility.
+-void applyAuthHeaders(freeink::SecureHttpClient& http) {
+-  http.addHeader("Accept", "application/vnd.koreader.v1+json");
+-  http.addHeader("x-auth-user", KOREADER_STORE.getUsername());
+-  http.addHeader("x-auth-key", KOREADER_STORE.getMd5Password());
++// The shared KOSync auth headers. x-auth-* is the native KOSync scheme; Basic
++// auth is added for Calibre-Web-Automated compatibility.
++void applyAuthHeaders(KOSyncRequest& request) {
++  request.headers.emplace_back("Accept", "application/vnd.koreader.v1+json");
++  request.headers.emplace_back("x-auth-user", KOREADER_STORE.getUsername());
++  request.headers.emplace_back("x-auth-key", KOREADER_STORE.getMd5Password());
+   const std::string credentials = KOREADER_STORE.getUsername() + ":" + KOREADER_STORE.getPassword();
+   const String encoded = base64::encode(credentials.c_str());
+-  http.addHeader("Authorization", std::string("Basic ") + encoded.c_str());
++  request.headers.emplace_back("Authorization", std::string("Basic ") + encoded.c_str());
+ }
+ 
+ // Caller-configured headers (e.g. a Cloudflare Access service token) applied
+-// on top of the KOSync auth scheme, including on createUser() which has no
++// before the KOSync auth scheme, including on createUser() which has no
+ // KOSync credentials yet.
+-void applyCustomHeaders(freeink::SecureHttpClient& http) {
++void applyCustomHeaders(KOSyncRequest& request) {
+   for (const auto& header : KOREADER_STORE.getCustomHeaders()) {
+-    if (!header.name.empty()) http.addHeader(header.name, header.value);
++    if (!header.name.empty()) request.headers.emplace_back(header.name, header.value);
+   }
+ }
+ 
++// The upstream transport: one HTTPS request per call over the active Wi-Fi link.
++class WifiHttpsTransport final : public KOSyncTransport {
++ public:
++  int perform(const KOSyncRequest& request, std::string* responseBody) override {
++    const std::string url = KOREADER_STORE.getBaseUrl() + request.path;
++    freeink::SecureHttpClient http;
++    http.setInsecure();
++    if (!http.begin(url)) {
++      LOG_ERR("KOSync", "Bad URL: %s", url.c_str());
++      return -1;
++    }
++    for (const auto& header : request.headers) http.addHeader(header.first, header.second);
++    const int httpCode = request.body ? http.sendRequest(request.method, *request.body) : http.GET();
++    if (responseBody && httpCode > 0) *responseBody = http.getString();
++    http.end();
++    return httpCode;
++  }
++  bool needsTlsHeap() const override { return true; }
++};
++
++WifiHttpsTransport wifiTransport;
++KOSyncTransport* activeTransport = &wifiTransport;
++
+ // True when free heap is too low to risk a TLS handshake.
+ bool insufficientHeap() {
+   const auto heap = HalMemory::getDefaultHeap();
+@@ -55,8 +79,14 @@ bool insufficientHeap() {
+   }
+   return false;
+ }
++
++bool lowMemoryForTransport() { return activeTransport->needsTlsHeap() && insufficientHeap(); }
+ }  // namespace
+ 
++void KOReaderSyncClient::setTransport(KOSyncTransport* transport) {
++  activeTransport = transport ? transport : &wifiTransport;
++}
++
+ KOReaderSyncClient::Error KOReaderSyncClient::authenticate() {
+   lastHttpCode = 0;
+   if (!KOREADER_STORE.hasCredentials()) {
+@@ -64,20 +94,14 @@ KOReaderSyncClient::Error KOReaderSyncClient::authenticate() {
+     return NO_CREDENTIALS;
+   }
+ 
+-  const std::string url = KOREADER_STORE.getBaseUrl() + "/users/auth";
+-  LOG_DBG("KOSync", "Authenticating: %s (heap: %u)", url.c_str(), (unsigned)ESP.getFreeHeap());
+-  if (insufficientHeap()) return LOW_MEMORY;
++  KOSyncRequest request;
++  request.path = "/users/auth";
++  LOG_DBG("KOSync", "Authenticating: %s (heap: %u)", request.path.c_str(), (unsigned)ESP.getFreeHeap());
++  if (lowMemoryForTransport()) return LOW_MEMORY;
+ 
+-  freeink::SecureHttpClient http;
+-  http.setInsecure();
+-  if (!http.begin(url)) {
+-    LOG_ERR("KOSync", "Bad URL: %s", url.c_str());
+-    return NETWORK_ERROR;
+-  }
+-  applyCustomHeaders(http);
+-  applyAuthHeaders(http);
+-  const int httpCode = http.GET();
+-  http.end();
++  applyCustomHeaders(request);
++  applyAuthHeaders(request);
++  const int httpCode = activeTransport->perform(request, nullptr);
+   lastHttpCode = httpCode;
+ 
+   LOG_DBG("KOSync", "Auth response: %d", httpCode);
+@@ -98,9 +122,11 @@ KOReaderSyncClient::Error KOReaderSyncClient::createUser() {
+     return NO_CREDENTIALS;
+   }
+ 
+-  const std::string url = KOREADER_STORE.getBaseUrl() + "/users/create";
+-  LOG_DBG("KOSync", "Creating account: %s (heap: %u)", url.c_str(), (unsigned)ESP.getFreeHeap());
+-  if (insufficientHeap()) return LOW_MEMORY;
++  KOSyncRequest request;
++  request.method = "POST";
++  request.path = "/users/create";
++  LOG_DBG("KOSync", "Creating account: %s (heap: %u)", request.path.c_str(), (unsigned)ESP.getFreeHeap());
++  if (lowMemoryForTransport()) return LOW_MEMORY;
+ 
+   JsonDocument doc;
+   doc["username"] = KOREADER_STORE.getUsername();
+@@ -108,17 +134,11 @@ KOReaderSyncClient::Error KOReaderSyncClient::createUser() {
+   std::string body;
+   serializeJson(doc, body);
+ 
+-  freeink::SecureHttpClient http;
+-  http.setInsecure();
+-  if (!http.begin(url)) {
+-    LOG_ERR("KOSync", "Bad URL: %s", url.c_str());
+-    return NETWORK_ERROR;
+-  }
+-  applyCustomHeaders(http);
+-  http.addHeader("Accept", "application/vnd.koreader.v1+json");
+-  http.addHeader("Content-Type", "application/json");
+-  const int httpCode = http.sendRequest("POST", body);
+-  http.end();
++  applyCustomHeaders(request);
++  request.headers.emplace_back("Accept", "application/vnd.koreader.v1+json");
++  request.headers.emplace_back("Content-Type", "application/json");
++  request.body = &body;
++  const int httpCode = activeTransport->perform(request, nullptr);
+   lastHttpCode = httpCode;
+ 
+   LOG_DBG("KOSync", "Create user response: %d", httpCode);
+@@ -137,42 +157,30 @@ KOReaderSyncClient::Error KOReaderSyncClient::getProgress(const std::string& doc
+     return NO_CREDENTIALS;
+   }
+ 
+-  const std::string url =
+-      KOREADER_STORE.getBaseUrl() + "/syncs/progress/" + documentHash + "?position_kinds=locator,percentage";
+-  LOG_DBG("KOSync", "Getting progress: %s (heap: %u)", url.c_str(), (unsigned)ESP.getFreeHeap());
+-  if (insufficientHeap()) return LOW_MEMORY;
++  KOSyncRequest request;
++  request.path = "/syncs/progress/" + documentHash + "?position_kinds=locator,percentage";
++  LOG_DBG("KOSync", "Getting progress: %s (heap: %u)", request.path.c_str(), (unsigned)ESP.getFreeHeap());
++  if (lowMemoryForTransport()) return LOW_MEMORY;
+ 
+-  freeink::SecureHttpClient http;
+-  http.setInsecure();
+-  if (!http.begin(url)) {
+-    LOG_ERR("KOSync", "Bad URL: %s", url.c_str());
+-    return NETWORK_ERROR;
+-  }
+-  applyCustomHeaders(http);
+-  applyAuthHeaders(http);
+-  const int httpCode = http.GET();
++  applyCustomHeaders(request);
++  applyAuthHeaders(request);
++  std::string responseBody;
++  const int httpCode = activeTransport->perform(request, &responseBody);
+   lastHttpCode = httpCode;
+ 
+   LOG_DBG("KOSync", "Get progress response: %d", httpCode);
+ 
+-  if (httpCode <= 0) {
+-    http.end();
+-    return NETWORK_ERROR;
+-  }
++  if (httpCode <= 0) return NETWORK_ERROR;
+ 
+   // 204 = success with no stored progress for this document (Spring-style
+   // KOSync implementations; the reference server answers 200 with an empty
+   // object instead). Map it to the same graceful no-remote-progress path as
+   // 404 rather than falling through to SERVER_ERROR — see issue #2876.
+-  if (httpCode == 204) {
+-    http.end();
+-    return NOT_FOUND;
+-  }
++  if (httpCode == 204) return NOT_FOUND;
+ 
+   if (httpCode >= 200 && httpCode < 300) {
+     JsonDocument doc;
+-    const DeserializationError error = deserializeJson(doc, http.getString().c_str());
+-    http.end();
++    const DeserializationError error = deserializeJson(doc, responseBody.c_str());
+ 
+     if (error) {
+       LOG_ERR("KOSync", "JSON parse failed: %s", error.c_str());
+@@ -209,7 +217,6 @@ KOReaderSyncClient::Error KOReaderSyncClient::getProgress(const std::string& doc
+     return OK;
+   }
+ 
+-  http.end();
+   if (httpCode == 401) return AUTH_FAILED;
+   if (httpCode == 404) return NOT_FOUND;
+   return SERVER_ERROR;
+@@ -222,9 +229,11 @@ KOReaderSyncClient::Error KOReaderSyncClient::updateProgress(const KOReaderProgr
+     return NO_CREDENTIALS;
+   }
+ 
+-  const std::string url = KOREADER_STORE.getBaseUrl() + "/syncs/progress";
+-  LOG_DBG("KOSync", "Updating progress: %s (heap: %u)", url.c_str(), (unsigned)ESP.getFreeHeap());
+-  if (insufficientHeap()) return LOW_MEMORY;
++  KOSyncRequest request;
++  request.method = "PUT";
++  request.path = "/syncs/progress";
++  LOG_DBG("KOSync", "Updating progress: %s (heap: %u)", request.path.c_str(), (unsigned)ESP.getFreeHeap());
++  if (lowMemoryForTransport()) return LOW_MEMORY;
+ 
+   // Build JSON body
+   JsonDocument doc;
+@@ -276,17 +285,11 @@ KOReaderSyncClient::Error KOReaderSyncClient::updateProgress(const KOReaderProgr
+ 
+   LOG_DBG("KOSync", "Request body: %s", body.c_str());
+ 
+-  freeink::SecureHttpClient http;
+-  http.setInsecure();
+-  if (!http.begin(url)) {
+-    LOG_ERR("KOSync", "Bad URL: %s", url.c_str());
+-    return NETWORK_ERROR;
+-  }
+-  applyCustomHeaders(http);
+-  applyAuthHeaders(http);
+-  http.addHeader("Content-Type", "application/json");
+-  const int httpCode = http.sendRequest("PUT", body);
+-  http.end();
++  applyCustomHeaders(request);
++  applyAuthHeaders(request);
++  request.headers.emplace_back("Content-Type", "application/json");
++  request.body = &body;
++  const int httpCode = activeTransport->perform(request, nullptr);
+   lastHttpCode = httpCode;
+ 
+   LOG_DBG("KOSync", "Update progress response: %d", httpCode);
+diff --git a/lib/KOReaderSync/KOReaderSyncClient.h b/lib/KOReaderSync/KOReaderSyncClient.h
+index ba527de..ac11503 100644
+--- a/lib/KOReaderSync/KOReaderSyncClient.h
++++ b/lib/KOReaderSync/KOReaderSyncClient.h
+@@ -5,6 +5,8 @@
+ #include <utility>
+ #include <vector>
+ 
++class KOSyncTransport;
++
+ /**
+  * Optional document metadata sent alongside progress sync requests.
+  * Mirrors the metadata object added in KOReader PR #15306 and adds bounded
+@@ -120,4 +122,10 @@ class KOReaderSyncClient {
+ 
+   /** HTTP status code from the last request (for diagnostics). */
+   static int lastHttpCode;
++
++  /**
++   * Route requests through another transport (null: Wi-Fi HTTPS, the default).
++   * The caller keeps ownership and must reset it before the transport dies.
++   */
++  static void setTransport(KOSyncTransport* transport);
+ };
+diff --git a/lib/KOReaderSync/KOReaderSyncTransport.h b/lib/KOReaderSync/KOReaderSyncTransport.h
+new file mode 100644
+index 0000000..a59fa6d
+--- /dev/null
++++ b/lib/KOReaderSync/KOReaderSyncTransport.h
+@@ -0,0 +1,24 @@
++#pragma once
++#include <string>
++#include <utility>
++#include <vector>
++
++// One KOSync HTTP request, independent of how it reaches the server.
++struct KOSyncRequest {
++  const char* method = "GET";
++  std::string path;  // starts with '/', appended to the configured base URL
++  std::vector<std::pair<std::string, std::string>> headers;
++  const std::string* body = nullptr;  // null: no body
++};
++
++// Carries KOSync requests to the server. The default sends them over Wi-Fi
++// HTTPS; a relay can carry them over another link instead.
++class KOSyncTransport {
++ public:
++  virtual ~KOSyncTransport() = default;
++  // Returns the HTTP status, or <= 0 when no response arrived. The response
++  // body is written to responseBody when it is not null.
++  virtual int perform(const KOSyncRequest& request, std::string* responseBody) = 0;
++  // True when a request opens a TLS session on this device (heap preflight).
++  virtual bool needsTlsHeap() const { return false; }
++};
+-- 
+2.56.0
+
