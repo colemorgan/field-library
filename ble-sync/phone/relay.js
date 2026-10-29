@@ -295,10 +295,17 @@ export class RelaySession {
   async run() {
     this.link.onData((chunk) => this.onChunk(chunk));
     this.link.onDisconnect(() => this.end('disconnected', { close: false }));
-    this.helloTimer = this.setTimeout(() => {
-      if (!this.readerHello) this.end('no hello from reader');
-    }, this.helloTimeoutMs);
-    this.send(buildHello()).catch((err) => this.end(`write failed: ${err?.message ?? err}`));
+    // The first write to the encrypted rx can wait on passkey entry, so the
+    // reader-reply timer starts only once the hello has been written.
+    this.send(buildHello()).then(
+      () => {
+        if (this.ended) return;
+        this.helloTimer = this.setTimeout(() => {
+          if (!this.readerHello) this.end('no hello from reader');
+        }, this.helloTimeoutMs);
+      },
+      (err) => this.end(`write failed: ${err?.message ?? err}`),
+    );
     return this.done;
   }
 

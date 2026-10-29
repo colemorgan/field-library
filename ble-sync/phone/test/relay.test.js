@@ -419,3 +419,26 @@ test('default timers are not called as methods (browsers throw "Illegal invocati
     globalThis.clearTimeout = realClear;
   }
 });
+
+test('session: hello timeout starts only after the hello write completes (passkey entry)', async () => {
+  const { phone } = createLinkPair();
+  let releaseWrite;
+  const pending = new Promise((r) => (releaseWrite = r));
+  const write = phone.write;
+  let first = true;
+  phone.write = async (chunk) => {
+    if (first) {
+      first = false;
+      await pending; // first write blocks while the user types the passkey
+    }
+    return write(chunk);
+  };
+  const session = new RelaySession({ link: phone, fetch: async () => {}, helloTimeoutMs: 20 });
+  let result = null;
+  session.run().then((r) => (result = r));
+  await new Promise((r) => setTimeout(r, 60));
+  assert.equal(result, null, 'session must not time out while the hello write is pending');
+  releaseWrite();
+  await new Promise((r) => setTimeout(r, 80));
+  assert.deepEqual(result, { reason: 'no hello from reader' });
+});
