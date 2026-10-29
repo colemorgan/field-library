@@ -1,7 +1,7 @@
 From a8438b3a75c86ac7b2aea296a55b980027d90c97 Mon Sep 17 00:00:00 2001
 From: Cole Morgan <colerussellmorgan@gmail.com>
 Date: Wed, 28 Oct 2026 22:42:46 -0400
-Subject: [PATCH 2/4] FieldBleSync: BLE peripheral relay for KOReader sync via
+Subject: [PATCH 2/5] FieldBleSync: BLE peripheral relay for KOReader sync via
  a phone
 
 New library implementing the Field Sync protocol v1 (reader side):

@@ -341,7 +341,8 @@ export class RelaySession {
         return this.handleReq(msg);
       case 'bye':
         this.log('info', `Reader finished (${typeof msg.reason === 'string' ? msg.reason : 'bye'})`);
-        return this.end('done');
+        // Only "done" (or no reason) is a successful sync; "error", "cancel", "timeout" are not.
+        return this.end(msg.reason === undefined || msg.reason === 'done' ? 'done' : `reader ended: ${String(msg.reason).slice(0, 40)}`);
       case 'error':
         this.log('error', `Reader reported error: ${typeof msg.code === 'string' ? msg.code : 'unknown'}`);
         return this.end(`reader error: ${msg.code}`);

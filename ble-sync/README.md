@@ -19,7 +19,7 @@ sync server ⇄ (HTTPS, mobile data) ⇄ phone ⇄ (Bluetooth LE) ⇄ reader (Cr
 
 - Firmware: `env:x4c` builds. 910/910 host tests pass, 34 of them for this feature. It costs 17.6 KB
   of flash and 16 B of static RAM.
-- Phone: 51/51 tests pass, including an end-to-end session against a mock sync server at MTU 23 and
+- Phone: 52/52 tests pass, including an end-to-end session against a mock sync server at MTU 23 and
   MTU 247. A headless browser check found no console errors.
 - **Nothing has run on real hardware.** Pairing, advertising, heap use while Bluetooth is on, and
   page-turner reconnection all still need the device.
@@ -38,6 +38,7 @@ sync server ⇄ (HTTPS, mobile data) ⇄ phone ⇄ (Bluetooth LE) ⇄ reader (Cr
 ## Known limits
 
 - Clipping sync, Sign Up and Authenticate still need Wi-Fi.
+- Servers that need Basic auth (Calibre-Web-Automated) do not work over Bluetooth.
 - The phone bond shares NimBLE's 3 bond slots with page-turner remotes. When they're full, the oldest
   bond is replaced.
 - Custom sync servers must allow cross-origin requests (CORS) for the web app. A native app does not

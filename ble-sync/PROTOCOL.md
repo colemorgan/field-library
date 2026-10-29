@@ -124,5 +124,6 @@ The reader sends `bye` when its sync finishes, then disconnects and stops advert
 1. Open the Field Sync web app (it must be served over HTTPS or from localhost).
 2. Tap **Sync with reader**, choose `FieldSync-XXXX`, and enter the passkey on first pairing.
 3. The app shows each relayed request (method, path, status). It sees the reader's sync credentials
-   in transit (`x-auth-key`, and `Authorization: Basic` if configured, which holds the plain
-   password) but never stores or logs them.
+   in transit (`x-auth-user`, `x-auth-key`) but never stores or logs them. The reader does not
+   send `Authorization: Basic` over the relay: the default server's CORS rules reject it, and it
+   would expose the plain password.

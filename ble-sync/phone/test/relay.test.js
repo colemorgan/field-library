@@ -376,6 +376,13 @@ test('session: cancel sends bye to the reader', async () => {
   assert.deepEqual(await done, { reason: 'cancelled' });
 });
 
+test('session: reader bye with a failure reason is not reported as done', async () => {
+  const { fake, done } = startSession({ fetch: async () => fakeResponse(200, '{}') });
+  await fake.handshake();
+  await fake.send({ t: 'bye', reason: 'error' });
+  assert.deepEqual(await done, { reason: 'reader ended: error' });
+});
+
 test('session: reader error message ends the session', async () => {
   const { fake, done } = startSession({ fetch: async () => fakeResponse(200, '{}') });
   await fake.handshake();
