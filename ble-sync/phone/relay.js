@@ -325,6 +325,9 @@ export class RelaySession {
   /** User-initiated stop: tell the reader, then disconnect. */
   async cancel(reason = 'cancelled') {
     if (this.ended) return this.done;
+    // Before the handshake the hello write may still be pending on pairing,
+    // and a bye would queue behind it: just close.
+    if (!this.readerHello) return this.end(reason);
     try {
       await this.send(buildBye(reason));
     } catch {

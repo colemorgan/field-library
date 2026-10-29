@@ -435,12 +435,22 @@ test('session: hello timeout starts only after the hello write completes (passke
   };
   const session = new RelaySession({ link: phone, fetch: async () => {}, helloTimeoutMs: 20 });
   let result = null;
-  session.run().then((r) => (result = r));
+  const done = session.run().then((r) => (result = r));
   await new Promise((r) => setTimeout(r, 60));
   assert.equal(result, null, 'session must not time out while the hello write is pending');
   releaseWrite();
-  await new Promise((r) => setTimeout(r, 80));
+  await done;
   assert.deepEqual(result, { reason: 'no hello from reader' });
+});
+
+test('session: cancel ends the session while the hello write is still pending', async () => {
+  const { phone } = createLinkPair();
+  phone.write = () => new Promise(() => {}); // pairing never finishes
+  const session = new RelaySession({ link: phone, fetch: async () => {} });
+  const done = session.run();
+  await new Promise((r) => setTimeout(r, 10));
+  await session.cancel();
+  assert.deepEqual(await done, { reason: 'cancelled' });
 });
 
 test('session: a failed first hello write (pairing in progress) is retried', async () => {
